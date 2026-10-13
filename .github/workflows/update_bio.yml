@@ -1,0 +1,123 @@
+name: Telegram Auto Updater (All-in-One)
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: telegram-updater
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run-all:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compute run flags
+        id: flags
+        run: |
+          IRAN_HOUR=$(TZ="Asia/Tehran" date +%H)
+          IRAN_MIN=$(TZ="Asia/Tehran" date +%M)
+          IRAN_HOUR=${IRAN_HOUR#0}; IRAN_HOUR=${IRAN_HOUR:-0}
+          IRAN_MIN=${IRAN_MIN#0}; IRAN_MIN=${IRAN_MIN:-0}
+
+          echo "🇮🇷 ساعت ایران: ${IRAN_HOUR}:${IRAN_MIN}"
+
+          IS_MANUAL="${{ github.event_name == 'workflow_dispatch' }}"
+
+          RUN_BIO=false
+          RUN_NAME=false
+          RUN_MAIN=false
+
+          if [ "$IRAN_HOUR" -lt 7 ] && [ "$IS_MANUAL" != "true" ]; then
+            echo "⏸ بازه خواب"
+            echo "bio=false"  >> "$GITHUB_OUTPUT"
+            echo "name=false" >> "$GITHUB_OUTPUT"
+            echo "main=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RUN_BIO=true
+
+          NEAR_TOP=false
+          if [ "$IRAN_MIN" -le 20 ]; then NEAR_TOP=true; fi
+
+          if [ "$NEAR_TOP" = "true" ] || [ "$IS_MANUAL" = "true" ]; then
+            RUN_NAME=true
+          fi
+
+          if [ "$NEAR_TOP" = "true" ] && \
+             { [ "$IRAN_HOUR" -eq 7 ]  || [ "$IRAN_HOUR" -eq 10 ] || \
+               [ "$IRAN_HOUR" -eq 13 ] || [ "$IRAN_HOUR" -eq 16 ] || \
+               [ "$IRAN_HOUR" -eq 19 ] || [ "$IRAN_HOUR" -eq 22 ]; }; then
+            RUN_MAIN=true
+          elif [ "$IS_MANUAL" = "true" ]; then
+            RUN_MAIN=true
+          fi
+
+          echo "bio=$RUN_BIO"   >> "$GITHUB_OUTPUT"
+          echo "name=$RUN_NAME" >> "$GITHUB_OUTPUT"
+          echo "main=$RUN_MAIN" >> "$GITHUB_OUTPUT"
+          echo "🔎 bio=$RUN_BIO | name=$RUN_NAME | main=$RUN_MAIN"
+
+      - name: Run py.py (Bio)
+        if: steps.flags.outputs.bio == 'true'
+        continue-on-error: true
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+        run: python py.py
+
+      - name: Run name.py
+        if: steps.flags.outputs.name == 'true'
+        continue-on-error: true
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+        run: python name.py
+
+      - name: Commit name state
+        if: steps.flags.outputs.name == 'true'
+        continue-on-error: true
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f name_state.json ]; then
+            git add name_state.json
+            if git diff --staged --quiet; then
+              echo "State تغییری نکرده."
+            else
+              git commit -m "chore: update name_state [skip ci]"
+              git push
+            fi
+          fi
+
+      - name: Run main.py
+        if: steps.flags.outputs.main == 'true'
+        continue-on-error: true
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+        run: python main.py
