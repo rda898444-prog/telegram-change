@@ -1,0 +1,48 @@
+name: Update Bio
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+jobs:
+  update-bio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check Iran time (skip 00:00-06:59)
+        id: timecheck
+        run: |
+          IRAN_HOUR=$(TZ="Asia/Tehran" date +%H)
+          IRAN_HOUR=${IRAN_HOUR#0}
+          IRAN_HOUR=${IRAN_HOUR:-0}
+          echo "🇮🇷 ساعت ایران: $IRAN_HOUR"
+          if [ "$IRAN_HOUR" -ge 7 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "⏸ بازه خواب - اجرا نمی‌شه."
+          fi
+
+      - name: Checkout repository
+        if: steps.timecheck.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.timecheck.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        if: steps.timecheck.outputs.run == 'true'
+        run: pip install telethon
+
+      - name: Run py.py
+        if: steps.timecheck.outputs.run == 'true'
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+        run: python py.py
