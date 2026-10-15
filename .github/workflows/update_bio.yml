@@ -1,8 +1,14 @@
 name: Telegram Auto Updater (All-in-One)
 
+env:
+  SLEEP_UNTIL_HOUR: '7'
+  BIO_INTERVAL_MIN: '5'
+  NAME_INTERVAL_MIN: '10'
+  MAIN_INTERVAL_MIN: '30'
+
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -41,6 +47,7 @@ jobs:
           IRAN_MIN=${IRAN_MIN#0}; IRAN_MIN=${IRAN_MIN:-0}
 
           echo "🇮🇷 ساعت ایران: ${IRAN_HOUR}:${IRAN_MIN}"
+          echo "⚙️  بازه‌ها: bio=${BIO_INTERVAL_MIN}m | name=${NAME_INTERVAL_MIN}m | main=${MAIN_INTERVAL_MIN}m"
 
           IS_MANUAL="${{ github.event_name == 'workflow_dispatch' }}"
 
@@ -48,7 +55,7 @@ jobs:
           RUN_NAME=false
           RUN_MAIN=false
 
-          if [ "$IRAN_HOUR" -lt 7 ] && [ "$IS_MANUAL" != "true" ]; then
+          if [ "$IRAN_HOUR" -lt "$SLEEP_UNTIL_HOUR" ] && [ "$IS_MANUAL" != "true" ]; then
             echo "⏸ بازه خواب"
             echo "bio=false"  >> "$GITHUB_OUTPUT"
             echo "name=false" >> "$GITHUB_OUTPUT"
@@ -58,19 +65,16 @@ jobs:
 
           RUN_BIO=true
 
-          NEAR_TOP=false
-          if [ "$IRAN_MIN" -le 20 ]; then NEAR_TOP=true; fi
-
-          if [ "$NEAR_TOP" = "true" ] || [ "$IS_MANUAL" = "true" ]; then
+          if [ $((IRAN_MIN % NAME_INTERVAL_MIN)) -eq 0 ]; then
             RUN_NAME=true
           fi
 
-          if [ "$NEAR_TOP" = "true" ] && \
-             { [ "$IRAN_HOUR" -eq 7 ]  || [ "$IRAN_HOUR" -eq 10 ] || \
-               [ "$IRAN_HOUR" -eq 13 ] || [ "$IRAN_HOUR" -eq 16 ] || \
-               [ "$IRAN_HOUR" -eq 19 ] || [ "$IRAN_HOUR" -eq 22 ]; }; then
+          if [ $((IRAN_MIN % MAIN_INTERVAL_MIN)) -eq 0 ]; then
             RUN_MAIN=true
-          elif [ "$IS_MANUAL" = "true" ]; then
+          fi
+
+          if [ "$IS_MANUAL" = "true" ]; then
+            RUN_NAME=true
             RUN_MAIN=true
           fi
 
