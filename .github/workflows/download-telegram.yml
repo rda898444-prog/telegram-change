@@ -1,11 +1,11 @@
-name: Download from Telegram to Release
+name: Download from Saved Messages (Auto-Fallback)
 
 on:
   workflow_dispatch:
     inputs:
-      tg_link:
-        description: 'Telegram Message Link (مثلاً https://t.me/...)'
-        required: true
+      msg_id:
+        description: 'شماره پیام (اختیاری - اگر خالی باشد، جدیدترین ویدیو را دانلود می‌کند)'
+        required: false
         type: string
       tag:
         description: 'Release tag (مثلاً v1)'
@@ -19,7 +19,7 @@ permissions:
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # ۶ ساعت (حداکثر زمان مجاز گیت‌هاب)
+    timeout-minutes: 360
     steps:
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -35,7 +35,7 @@ jobs:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           SESSION_STRING: ${{ secrets.TELEGRAM_SESSION }}
-          TG_LINK: ${{ inputs.tg_link }}
+          MSG_ID: ${{ inputs.msg_id }}
         run: |
           python - <<'PY'
           import os
@@ -47,32 +47,56 @@ jobs:
           api_id = int(os.environ["API_ID"])
           api_hash = os.environ["API_HASH"]
           session_str = os.environ["SESSION_STRING"]
-          tg_link = os.environ["TG_LINK"]
+          msg_id_str = os.environ.get("MSG_ID", "").strip()
 
           out_dir = Path("files")
           out_dir.mkdir(exist_ok=True)
+          message = None
 
-          print(f"Connecting to Telegram...")
+          print("Connecting to Telegram...")
           with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
-              print(f"Fetching message: {tg_link}")
-              # گرفتن پیام از لینک
-              message = client.get_messages(tg_link)
               
-              if not message or not message.media:
-                  print("❌ Error: No media found in this message.")
+              # --- تلاش اول: استفاده از آیدی پیام (اگر وارد شده باشد) ---
+              if msg_id_str:
+                  try:
+                      msg_id = int(msg_id_str)
+                      print(f"Looking for specific Message ID: {msg_id} in Saved Messages...")
+                      message = client.get_messages('me', ids=msg_id)
+                      
+                      if not message or not message.media:
+                          print(f"⚠️ پیام {msg_id} پیدا نشد یا حاوی فایل نبود. جستجو برای جدیدترین فایل...")
+                          message = None
+                  except ValueError:
+                      print("⚠️ فرمت آیدی پیام نامعتبر است. جستجو برای جدیدترین فایل...")
+                      message = None
+
+              # --- تلاش دوم: پیدا کردن جدیدترین فایل/ویدیو در پیام‌های ذخیره شده ---
+              if not message:
+                  print("Searching for the latest video/file in Saved Messages...")
+                  # گرفتن ۵۰ پیام اخیر
+                  messages = client.get_messages('me', limit=50)
+                  
+                  for msg in messages:
+                      # چک کردن اینکه پیام شامل ویدیو یا فایل (سند) باشد
+                      if msg.media and (msg.video or msg.document):
+                          message = msg
+                          print(f"✅ Found latest media: Message ID {msg.id} ({msg.file.name or 'Video'})")
+                          break
+
+              # اگر هیچ فایلی پیدا نشد، خارج شو
+              if not message:
+                  print("❌ خطا: هیچ فایل یا ویدیویی در پیام‌های ذخیره شده پیدا نشد.")
                   sys.exit(1)
 
               print(f"Downloading file (Size: {message.file.size / 1024 / 1024:.2f} MB)...")
-              # دانلود فایل
               downloaded_path = client.download_media(message, file=str(out_dir) + "/")
               
               if not downloaded_path:
-                  print("❌ Error: Download failed.")
+                  print("❌ خطا: دانلود فایل ناموفق بود.")
                   sys.exit(1)
                   
               print(f"✅ Downloaded: {downloaded_path}")
-
-              # ذخیره نام فایل برای مرحله بعد
+              
               filename = os.path.basename(downloaded_path)
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write(f"filename_url={filename}\n")
