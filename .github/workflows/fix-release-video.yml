@@ -1,0 +1,69 @@
+name: Fix moov in Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'اسم Release (مثلاً v1)'
+        required: true
+        default: 'v1'
+        type: string
+      filename:
+        description: 'اسم دقیق فایل در Release (مثلاً In_the_Realm.mp4)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  fix-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Download file from Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Downloading ${{ inputs.filename }} from release ${{ inputs.tag }}..."
+          gh release download ${{ inputs.tag }} --pattern "${{ inputs.filename }}" --output "original_file.mp4"
+
+      - name: Fix moov (Faststart)
+        run: |
+          echo "🔧 Moving moov atom to the front..."
+          ffmpeg -y -hide_banner -loglevel error -i "original_file.mp4" -c copy -movflags +faststart "fixed_file.mp4"
+          echo "✅ Done. Replacing original file..."
+          mv "fixed_file.mp4" "${{ inputs.filename }}"
+
+      - name: Delete old file from Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🗑️ Deleting old file from release..."
+          gh release delete-asset ${{ inputs.tag }} "${{ inputs.filename }}" --yes
+
+      - name: Upload fixed file back to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: ${{ inputs.filename }}
+
+      - name: Print result
+        run: |
+          LINK="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/${{ inputs.filename }}"
+          echo "🔗 Updated download link: $LINK"
+          {
+            echo "### 🔗 لینک دانلود (اصلاح‌شده)"
+            echo ""
+            echo '```'
+            echo "$LINK"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
