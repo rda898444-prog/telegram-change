@@ -1,0 +1,99 @@
+name: Download from Telegram to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tg_link:
+        description: 'Telegram Message Link (مثلاً https://t.me/...)'
+        required: true
+        type: string
+      tag:
+        description: 'Release tag (مثلاً v1)'
+        required: true
+        default: 'v1'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # ۶ ساعت (حداکثر زمان مجاز گیت‌هاب)
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Telethon
+        run: pip install telethon
+
+      - name: Download from Telegram
+        id: tg_download
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.TELEGRAM_SESSION }}
+          TG_LINK: ${{ inputs.tg_link }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+          from telethon.sync import TelegramClient
+          from telethon.sessions import StringSession
+
+          api_id = int(os.environ["API_ID"])
+          api_hash = os.environ["API_HASH"]
+          session_str = os.environ["SESSION_STRING"]
+          tg_link = os.environ["TG_LINK"]
+
+          out_dir = Path("files")
+          out_dir.mkdir(exist_ok=True)
+
+          print(f"Connecting to Telegram...")
+          with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
+              print(f"Fetching message: {tg_link}")
+              # گرفتن پیام از لینک
+              message = client.get_messages(tg_link)
+              
+              if not message or not message.media:
+                  print("❌ Error: No media found in this message.")
+                  sys.exit(1)
+
+              print(f"Downloading file (Size: {message.file.size / 1024 / 1024:.2f} MB)...")
+              # دانلود فایل
+              downloaded_path = client.download_media(message, file=str(out_dir) + "/")
+              
+              if not downloaded_path:
+                  print("❌ Error: Download failed.")
+                  sys.exit(1)
+                  
+              print(f"✅ Downloaded: {downloaded_path}")
+
+              # ذخیره نام فایل برای مرحله بعد
+              filename = os.path.basename(downloaded_path)
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"filename_url={filename}\n")
+          PY
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          files: files/*
+          fail_on_unmatched_files: true
+
+      - name: Print download link
+        run: |
+          LINK="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/${{ steps.tg_download.outputs.filename_url }}"
+          echo "🔗 Download link: $LINK"
+          {
+            echo "### 🔗 لینک دانلود"
+            echo ""
+            echo '```'
+            echo "$LINK"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
