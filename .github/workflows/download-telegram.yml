@@ -53,10 +53,21 @@ jobs:
           out_dir.mkdir(exist_ok=True)
           message = None
 
+          # تابعی برای نمایش درصد پیشرفت دانلود
+          progress_state = {"last_mb": 0}
+          def progress_callback(current, total):
+              current_mb = current / (1024 * 1024)
+              total_mb = total / (1024 * 1024)
+              # هر ۵ مگابایت یکبار لاگ چاپ می‌شود تا لاگ‌ها شلوغ نشوند
+              if current_mb - progress_state["last_mb"] >= 5 or current == total:
+                  progress_state["last_mb"] = current_mb
+                  percent = (current / total) * 100
+                  print(f"⬇️ Progress: {percent:.1f}% ({current_mb:.1f} MB / {total_mb:.1f} MB)", flush=True)
+
           print("Connecting to Telegram...")
           with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
               
-              # --- تلاش اول: استفاده از آیدی پیام (اگر وارد شده باشد) ---
+              # --- تلاش اول: استفاده از آیدی پیام ---
               if msg_id_str:
                   try:
                       msg_id = int(msg_id_str)
@@ -70,32 +81,42 @@ jobs:
                       print("⚠️ فرمت آیدی پیام نامعتبر است. جستجو برای جدیدترین فایل...")
                       message = None
 
-              # --- تلاش دوم: پیدا کردن جدیدترین فایل/ویدیو در پیام‌های ذخیره شده ---
+              # --- تلاش دوم: پیدا کردن جدیدترین فایل ---
               if not message:
                   print("Searching for the latest video/file in Saved Messages...")
-                  # گرفتن ۵۰ پیام اخیر
                   messages = client.get_messages('me', limit=50)
                   
                   for msg in messages:
-                      # چک کردن اینکه پیام شامل ویدیو یا فایل (سند) باشد
                       if msg.media and (msg.video or msg.document):
                           message = msg
-                          print(f"✅ Found latest media: Message ID {msg.id} ({msg.file.name or 'Video'})")
                           break
 
-              # اگر هیچ فایلی پیدا نشد، خارج شو
               if not message:
                   print("❌ خطا: هیچ فایل یا ویدیویی در پیام‌های ذخیره شده پیدا نشد.")
                   sys.exit(1)
 
-              print(f"Downloading file (Size: {message.file.size / 1024 / 1024:.2f} MB)...")
-              downloaded_path = client.download_media(message, file=str(out_dir) + "/")
+              # نمایش مشخصات فایل قبل از شروع دانلود
+              file_name = message.file.name or "Unknown_Video.mp4"
+              file_size = message.file.size / 1024 / 1024
+              print("========================================")
+              print(f"📁 File Found: {file_name}")
+              print(f"⚖️ File Size: {file_size:.2f} MB")
+              print(f"🆔 Message ID: {message.id}")
+              print("========================================")
+              print("Starting download...")
+
+              # دانلود فایل همراه با نمایش درصد پیشرفت
+              downloaded_path = client.download_media(
+                  message, 
+                  file=str(out_dir) + "/",
+                  progress_callback=progress_callback
+              )
               
               if not downloaded_path:
-                  print("❌ خطا: دانلود فایل ناموفق بود.")
+                  print("\n❌ خطا: دانلود فایل ناموفق بود.")
                   sys.exit(1)
                   
-              print(f"✅ Downloaded: {downloaded_path}")
+              print(f"\n✅ Downloaded successfully: {downloaded_path}")
               
               filename = os.path.basename(downloaded_path)
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
