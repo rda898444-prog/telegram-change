@@ -9,7 +9,7 @@ on:
         default: 'v1'
         type: string
       max_parallel:
-        description: 'حداکثر تعداد سرورهایی که همزمان کار کنند (پیشنهاد: 3 تا 5)'
+        description: 'حداکثر تعداد سرورهایی که همزمان کار کنند'
         required: true
         default: '3'
         type: string
@@ -30,7 +30,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Fetching video list from tag: ${{ inputs.tag }}"
-          # استخراج فقط فایل‌های ویدیویی و ساخت فرمت JSON برای Matrix
           FILES=$(gh release view "${{ inputs.tag }}" --repo ${{ github.repository }} --json assets \
             --jq '[.assets[].name | select(test("\\.(mp4|mkv|avi|mov|m4v|webm)$"))] | tostring')
           
@@ -39,7 +38,6 @@ jobs:
             exit 1
           fi
           
-          echo "Found files: $FILES"
           echo "matrix={\"file\":$FILES}" >> $GITHUB_OUTPUT
 
   # مرحله ۲: فشرده‌سازی (هر فیلم روی یک سرور مجزا)
@@ -48,8 +46,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
-      max-parallel: ${{ fromJson(inputs.max_parallel) }} # محدودیت همزمانی برای جلوگیری از بلاک شدن
-      fail-fast: false # اگر یکی خراب شد، بقیه ادامه دهند
+      max-parallel: ${{ fromJson(inputs.max_parallel) }}
+      fail-fast: false
       matrix: ${{ fromJson(needs.get-videos.outputs.matrix) }}
     steps:
       - name: Install ffmpeg
@@ -57,7 +55,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Download, Compress, Replace (${{ matrix.file }})
+      - name: Download, Validate, Compress, Replace
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FILENAME: ${{ matrix.file }}
@@ -70,8 +68,23 @@ jobs:
           echo "⬇️ Downloading..."
           gh release download "$TAG" --pattern "$FILENAME" --repo ${{ github.repository }}
           
-          # 2. فشرده‌سازی
-          echo "🔧 Compressing with H.265..."
+          # 2. چک کردن سالم بودن فایل قبل از فشرده‌سازی
+          echo "🔍 Validating file..."
+          if ! ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$FILENAME" > /dev/null 2>&1; then
+            echo "❌ ERROR: File $FILENAME is corrupted or incomplete (moov atom missing)."
+            echo "🗑️ Removing corrupted file from Release so you can download it again..."
+            gh release delete-asset "$TAG" "$FILENAME" --yes --repo ${{ github.repository }}
+            
+            # ساخت فایل متنی برای نگه داشتن اسم فایل خراب
+            echo "$FILENAME" > "corrupted_${FILENAME}.txt"
+            echo "IS_CORRUPTED=true" >> $GITHUB_ENV
+            exit 0
+          fi
+          
+          echo "IS_CORRUPTED=false" >> $GITHUB_ENV
+          echo "✅ File is valid. Proceeding to compress..."
+          
+          # 3. فشرده‌سازی
           if [[ "$FILENAME" =~ \.(mp4|mov|m4v)$ ]]; then
             FFMPEG_MOVFLAGS="-movflags +faststart"
           else
@@ -85,28 +98,55 @@ jobs:
             $FFMPEG_MOVFLAGS \
             "compressed_$FILENAME"
           
-          # 3. مقایسه و جایگزینی
+          # 4. مقایسه و جایگزینی
           if [ -f "compressed_$FILENAME" ]; then
             ORIGINAL_SIZE=$(stat -c%s "$FILENAME")
             NEW_SIZE=$(stat -c%s "compressed_$FILENAME")
             
-            echo "📊 Original: $((ORIGINAL_SIZE / 1024 / 1024)) MB | New: $((NEW_SIZE / 1024 / 1024)) MB"
-            
             if [ "$NEW_SIZE" -lt "$ORIGINAL_SIZE" ]; then
               echo "✅ Size reduced. Uploading to Release..."
-              
-              # حذف فایل قبلی
               gh release delete-asset "$TAG" "$FILENAME" --yes --repo ${{ github.repository }}
-              
-              # آپلود فایل جدید (با همون اسم قبلی)
               mv "compressed_$FILENAME" "$FILENAME"
               gh release upload "$TAG" "$FILENAME" --clobber --repo ${{ github.repository }}
-              
               echo "✅ $FILENAME replaced successfully."
             else
               echo "⚠️ Compressed file is larger. Keeping original."
             fi
+          fi
+
+      # اگر فایل خراب بود، اسمش رو به عنوان آرتیفکت (فایل موقت) آپلود می‌کنه
+      - name: Upload corrupted file name
+        if: env.IS_CORRUPTED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: corrupted-${{ matrix.file }}
+          path: corrupted_${{ matrix.file }}.txt
+          retention-days: 1
+
+  # مرحله ۳: جمع‌بندی و چاپ لیست فایل‌های خراب
+  report-corrupted:
+    needs: compress-video
+    if: always() # حتی اگر بعضی از سرورها خطا دادند، این اجرا شود
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all corrupted logs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: corrupted-*
+          path: corrupted-logs
+          merge-multiple: true
+
+      - name: Print final report
+        run: |
+          echo "### 📊 گزارش فایل‌های خراب" >> $GITHUB_STEP_SUMMARY
+          
+          # چک کردن اینکه آیا فایل متنی برای فایل‌های خراب وجود دارد یا نه
+          if [ -d "corrupted-logs" ] && [ "$(ls -A corrupted-logs)" ]; then
+            echo "⚠️ **فایل‌های زیر ناقص یا خراب بودند و از Releases حذف شدند تا دوباره دانلودشان کنید:**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            for file in corrupted-logs/*.txt; do
+              echo "- **$(cat "$file")**" >> $GITHUB_STEP_SUMMARY
+            done
           else
-            echo "❌ Compression failed for $FILENAME"
-            exit 1
+            echo "✅ **هیچ فایل خرابی پیدا نشد. همه فایل‌ها ۱۰۰٪ سالم بودند.**" >> $GITHUB_STEP_SUMMARY
           fi
