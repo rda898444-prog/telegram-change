@@ -1,4 +1,4 @@
-name: Compress Video in Release (H.265)
+name: Compress All Videos in Release (H.265)
 
 on:
   workflow_dispatch:
@@ -8,16 +8,12 @@ on:
         required: true
         default: 'v1'
         type: string
-      filename:
-        description: 'اسم دقیق فایل در Release'
-        required: true
-        type: string
 
 permissions:
   contents: write
 
 jobs:
-  compress-video:
+  compress-videos:
     runs-on: ubuntu-latest
     timeout-minutes: 360 # حداکثر ۶ ساعت برای انکود سنگین
     steps:
@@ -26,65 +22,90 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Download original file from Release
+      - name: Process all videos in Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
         run: |
-          echo "Downloading ${{ inputs.filename }} from release ${{ inputs.tag }}..."
-          gh release download ${{ inputs.tag }} \
-            --pattern "${{ inputs.filename }}" \
-            --output "original_video.mp4" \
-            --repo ${{ github.repository }}
+          echo "Fetching release assets for tag: $TAG"
           
-          ORIGINAL_SIZE=$(stat -c%s "original_video.mp4")
-          echo "Original Size: $((ORIGINAL_SIZE / 1024 / 1024)) MB"
-
-      - name: Compress Video (H.265 + Audio Copy)
-        run: |
-          echo "🔧 Starting compression (This might take a while)..."
-          ffmpeg -y -hide_banner -loglevel warning -stats \
-            -i "original_video.mp4" \
-            -c:v libx265 -crf 22 -preset slow \
-            -c:a copy \
-            -movflags +faststart \
-            "compressed_video.mp4"
-
-      - name: Compare Sizes and Replace
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          ORIGINAL_SIZE=$(stat -c%s "original_video.mp4")
-          NEW_SIZE=$(stat -c%s "compressed_video.mp4")
+          # گرفتن لیست تمام فایل‌های داخل Release
+          ASSETS=$(gh release view "$TAG" --repo ${{ github.repository }} --json assets --jq '.assets[].name')
           
-          echo "📊 Original Size: $((ORIGINAL_SIZE / 1024 / 1024)) MB"
-          echo "📊 New Size:      $((NEW_SIZE / 1024 / 1024)) MB"
-          
-          if [ "$NEW_SIZE" -lt "$ORIGINAL_SIZE" ]; then
-            echo "✅ Compression successful! Size reduced."
-            
-            echo "🗑️ Deleting old file from release..."
-            gh release delete-asset ${{ inputs.tag }} "${{ inputs.filename }}" \
-              --yes \
-              --repo ${{ github.repository }}
-            
-            mv "compressed_video.mp4" "${{ inputs.filename }}"
-            
-            echo "⬆️ Uploading compressed file to Release..."
-            gh release upload ${{ inputs.tag }} "${{ inputs.filename }}" \
-              --clobber \
-              --repo ${{ github.repository }}
-            echo "✅ Upload complete."
-          else
-            echo "⚠️ Warning: Compressed file is larger or equal. Keeping original."
-            exit 0
+          if [ -z "$ASSETS" ]; then
+            echo "❌ No assets found in release $TAG"
+            exit 1
           fi
+          
+          # حلقه برای بررسی تک‌تک فایل‌ها
+          for FILENAME in $ASSETS; do
+            # بررسی اینکه آیا فایل پسوند ویدیویی دارد؟
+            if [[ "$FILENAME" =~ \.(mp4|mkv|avi|mov|m4v|webm)$ ]]; then
+              echo "=================================================="
+              echo "🎬 Found Video: $FILENAME"
+              
+              # 1. دانلود فایل
+              echo "⬇️ Downloading $FILENAME..."
+              gh release download "$TAG" --pattern "$FILENAME" --repo ${{ github.repository }}
+              
+              # 2. فشرده‌سازی با ffmpeg
+              echo "🔧 Compressing with H.265..."
+              
+              # بررسی اینکه آیا فایل MP4 است یا فرمت دیگر (چون movflags فقط برای MP4 و MOV است)
+              if [[ "$FILENAME" =~ \.(mp4|mov|m4v)$ ]]; then
+                FFMPEG_MOVFLAGS="-movflags +faststart"
+              else
+                FFMPEG_MOVFLAGS=""
+              fi
+              
+              # اجرای فشرده‌سازی
+              ffmpeg -y -hide_banner -loglevel warning -stats \
+                -i "$FILENAME" \
+                -c:v libx265 -crf 22 -preset slow \
+                -c:a copy \
+                $FFMPEG_MOVFLAGS \
+                "compressed_$FILENAME"
+              
+              # 3. مقایسه حجم و جایگزینی
+              if [ -f "compressed_$FILENAME" ]; then
+                ORIGINAL_SIZE=$(stat -c%s "$FILENAME")
+                NEW_SIZE=$(stat -c%s "compressed_$FILENAME")
+                
+                echo "📊 Original: $((ORIGINAL_SIZE / 1024 / 1024)) MB | New: $((NEW_SIZE / 1024 / 1024)) MB"
+                
+                if [ "$NEW_SIZE" -lt "$ORIGINAL_SIZE" ]; then
+                  echo "✅ Size reduced. Replacing file in Release..."
+                  
+                  # حذف فایل قدیمی از گیت‌هاب
+                  gh release delete-asset "$TAG" "$FILENAME" --yes --repo ${{ github.repository }}
+                  
+                  # تغییر نام فایل فشرده شده به اسم اصلی
+                  mv "compressed_$FILENAME" "$FILENAME"
+                  
+                  # آپلود فایل جدید
+                  gh release upload "$TAG" "$FILENAME" --clobber --repo ${{ github.repository }}
+                  echo "✅ Replacement complete for $FILENAME"
+                else
+                  echo "⚠️ Compressed file is larger or equal. Keeping original $FILENAME."
+                fi
+              else
+                echo "❌ Compression failed for $FILENAME"
+              fi
+              
+              # 4. پاکسازی فضای دیسک برای فایل بعدی
+              rm -f "$FILENAME" "compressed_$FILENAME"
+              echo "--------------------------------------------------"
+            fi
+          done
+          
+          echo "🎉 All videos processed!"
 
-      - name: Print result
+      - name: Print download links
         run: |
-          LINK="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/${{ inputs.filename }}"
-          echo "🔗 Updated download link: $LINK"
+          LINK="https://github.com/${{ github.repository }}/releases/tag/${{ inputs.tag }}"
+          echo "🔗 Release Link: $LINK"
           {
-            echo "### 🔗 لینک دانلود (فشرده‌شده و استریم)"
+            echo "### 🔗 لینک ریلیز (فایل‌های فشرده‌شده)"
             echo ""
             echo '```'
             echo "$LINK"
