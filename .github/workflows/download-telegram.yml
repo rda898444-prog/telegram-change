@@ -1,10 +1,15 @@
-name: Download from Saved Messages (Auto-Fallback)
+name: Download Multiple from Saved Messages
 
 on:
   workflow_dispatch:
     inputs:
+      count:
+        description: 'تعداد فیلم‌هایی که باید دانلود شوند (اگر msg_id خالی باشد)'
+        required: true
+        default: '5'
+        type: string
       msg_id:
-        description: 'شماره پیام (اختیاری - اگر خالی باشد، جدیدترین ویدیو را دانلود می‌کند)'
+        description: 'شماره پیام خاص (اختیاری - اگر پر شود، فقط همان را دانلود می‌کند)'
         required: false
         type: string
       tag:
@@ -30,16 +35,17 @@ jobs:
         run: pip install telethon
 
       - name: Download from Telegram
-        id: tg_download
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           SESSION_STRING: ${{ secrets.TELEGRAM_SESSION }}
           MSG_ID: ${{ inputs.msg_id }}
+          COUNT: ${{ inputs.count }}
         run: |
           python - <<'PY'
           import os
           import sys
+          import time
           from pathlib import Path
           from telethon.sync import TelegramClient
           from telethon.sessions import StringSession
@@ -48,79 +54,92 @@ jobs:
           api_hash = os.environ["API_HASH"]
           session_str = os.environ["SESSION_STRING"]
           msg_id_str = os.environ.get("MSG_ID", "").strip()
+          count = int(os.environ.get("COUNT", "5"))
 
           out_dir = Path("files")
           out_dir.mkdir(exist_ok=True)
-          message = None
-
-          # تابعی برای نمایش درصد پیشرفت دانلود
-          progress_state = {"last_mb": 0}
-          def progress_callback(current, total):
-              current_mb = current / (1024 * 1024)
-              total_mb = total / (1024 * 1024)
-              # هر ۵ مگابایت یکبار لاگ چاپ می‌شود تا لاگ‌ها شلوغ نشوند
-              if current_mb - progress_state["last_mb"] >= 5 or current == total:
-                  progress_state["last_mb"] = current_mb
-                  percent = (current / total) * 100
-                  print(f"⬇️ Progress: {percent:.1f}% ({current_mb:.1f} MB / {total_mb:.1f} MB)", flush=True)
+          messages_to_download = []
 
           print("Connecting to Telegram...")
           with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
               
-              # --- تلاش اول: استفاده از آیدی پیام ---
+              # --- حالت اول: اگر شماره پیام خاصی وارد شده باشد ---
               if msg_id_str:
                   try:
                       msg_id = int(msg_id_str)
-                      print(f"Looking for specific Message ID: {msg_id} in Saved Messages...")
-                      message = client.get_messages('me', ids=msg_id)
-                      
-                      if not message or not message.media:
-                          print(f"⚠️ پیام {msg_id} پیدا نشد یا حاوی فایل نبود. جستجو برای جدیدترین فایل...")
-                          message = None
+                      print(f"Looking for specific Message ID: {msg_id}...")
+                      msg = client.get_messages('me', ids=msg_id)
+                      if msg and msg.media:
+                          messages_to_download.append(msg)
+                      else:
+                          print(f"⚠️ پیام {msg_id} پیدا نشد یا فایل نبود. جستجو برای جدیدترین‌ها...")
                   except ValueError:
-                      print("⚠️ فرمت آیدی پیام نامعتبر است. جستجو برای جدیدترین فایل...")
-                      message = None
+                      print("⚠️ فرمت آیدی نامعتبر است.")
 
-              # --- تلاش دوم: پیدا کردن جدیدترین فایل ---
-              if not message:
-                  print("Searching for the latest video/file in Saved Messages...")
-                  messages = client.get_messages('me', limit=50)
+              # --- حالت دوم: پیدا کردن N فیلم آخر ---
+              if not messages_to_download:
+                  print(f"Searching for the latest {count} videos/files in Saved Messages...")
+                  recent_messages = client.get_messages('me', limit=100)
                   
-                  for msg in messages:
+                  for msg in recent_messages:
                       if msg.media and (msg.video or msg.document):
-                          message = msg
-                          break
+                          messages_to_download.append(msg)
+                          if len(messages_to_download) >= count:
+                              break
 
-              if not message:
-                  print("❌ خطا: هیچ فایل یا ویدیویی در پیام‌های ذخیره شده پیدا نشد.")
+              if not messages_to_download:
+                  print("❌ خطا: هیچ فایل یا ویدیویی پیدا نشد.")
                   sys.exit(1)
 
-              # نمایش مشخصات فایل قبل از شروع دانلود
-              file_name = message.file.name or "Unknown_Video.mp4"
-              file_size = message.file.size / 1024 / 1024
+              total_files = len(messages_to_download)
+              print(f"✅ Found {total_files} file(s) to download.")
               print("========================================")
-              print(f"📁 File Found: {file_name}")
-              print(f"⚖️ File Size: {file_size:.2f} MB")
-              print(f"🆔 Message ID: {message.id}")
-              print("========================================")
-              print("Starting download...")
 
-              # دانلود فایل همراه با نمایش درصد پیشرفت
-              downloaded_path = client.download_media(
-                  message, 
-                  file=str(out_dir) + "/",
-                  progress_callback=progress_callback
-              )
-              
-              if not downloaded_path:
-                  print("\n❌ خطا: دانلود فایل ناموفق بود.")
-                  sys.exit(1)
+              # حلقه دانلود فایل‌ها
+              for i, message in enumerate(messages_to_download, 1):
+                  file_name = message.file.name or f"Unknown_Video_{i}.mp4"
+                  file_size = message.file.size / 1024 / 1024
                   
-              print(f"\n✅ Downloaded successfully: {downloaded_path}")
-              
-              filename = os.path.basename(downloaded_path)
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                  f.write(f"filename_url={filename}\n")
+                  # محاسبه تعداد دانلود شده و باقی‌مانده
+                  downloaded_count = i - 1
+                  remaining_count = total_files - i
+
+                  print(f"\n[{i}/{total_files}] Downloading: {file_name}")
+                  print(f"📊 Status: {downloaded_count} downloaded, {remaining_count} remaining")
+                  print(f"⚖️ Size: {file_size:.2f} MB | ID: {message.id}")
+                  
+                  # تنظیمات محاسبه سرعت و پیشرفت
+                  start_time = time.time()
+                  progress_state = {"last_mb": 0}
+                  
+                  def progress_callback(current, total):
+                      current_mb = current / (1024 * 1024)
+                      total_mb = total / (1024 * 1024)
+                      
+                      # محاسبه سرعت
+                      elapsed_time = time.time() - start_time
+                      speed_mb_s = current_mb / elapsed_time if elapsed_time > 0 else 0
+
+                      # چاپ هر ۱۰ مگابایت یکبار
+                      if current_mb - progress_state["last_mb"] >= 10 or current == total:
+                          progress_state["last_mb"] = current_mb
+                          percent = (current / total) * 100
+                          print(f"   ⬇️ Progress: {percent:.1f}% ({current_mb:.1f}/{total_mb:.1f} MB) | Speed: {speed_mb_s:.2f} MB/s", flush=True)
+
+                  downloaded_path = client.download_media(
+                      message, 
+                      file=str(out_dir) + "/",
+                      progress_callback=progress_callback
+                  )
+                  
+                  if downloaded_path:
+                      print(f"   ✅ Downloaded successfully: {os.path.basename(downloaded_path)}")
+                  else:
+                      print(f"   ❌ Failed to download: {file_name}")
+                  
+                  print("-" * 50)
+
+          print("\n🎉 All downloads completed!")
           PY
 
       - name: Upload to Release
@@ -131,14 +150,25 @@ jobs:
           files: files/*
           fail_on_unmatched_files: true
 
-      - name: Print download link
+      - name: Print download links
         run: |
-          LINK="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/${{ steps.tg_download.outputs.filename_url }}"
-          echo "🔗 Download link: $LINK"
-          {
-            echo "### 🔗 لینک دانلود"
-            echo ""
-            echo '```'
-            echo "$LINK"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "### 🔗 لینک‌های دانلود" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          for file in files/*; do
+            if [ -f "$file" ]; then
+              FILENAME=$(basename "$file")
+              URL_FILENAME=$(echo "$FILENAME" | sed 's/ /%20/g')
+              LINK="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/$URL_FILENAME"
+              
+              echo "فایل: $FILENAME"
+              echo "$LINK"
+              echo ""
+              
+              echo "**$FILENAME**" >> $GITHUB_STEP_SUMMARY
+              echo "$LINK" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          
+          echo '```' >> $GITHUB_STEP_SUMMARY
