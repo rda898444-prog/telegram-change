@@ -1,4 +1,4 @@
-name: Download Multiple (10 Parallel Threads)
+name: Download from Telegram (Safe & Reliable)
 
 on:
   workflow_dispatch:
@@ -22,16 +22,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Setup Python
+      - name: Setup Python & ffmpeg
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Install telethon and cryptg
+      
+      - name: Install dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
           pip install telethon cryptg
 
-      - name: Download from Telegram (10 Threads)
+      - name: Download Safely from Telegram
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
@@ -41,10 +43,9 @@ jobs:
           python - <<'PY'
           import os
           import sys
-          import asyncio
-          import time
+          import subprocess
           from pathlib import Path
-          from telethon import TelegramClient
+          from telethon.sync import TelegramClient
           from telethon.sessions import StringSession
 
           api_id = int(os.environ["API_ID"])
@@ -54,50 +55,27 @@ jobs:
 
           out_dir = Path("files")
           out_dir.mkdir(exist_ok=True)
-          
-          downloaded_bytes = 0
 
-          # اصلاح باگ گیر کردن روی ۱۰۰٪
-          async def download_chunk(client, message, file_path, offset, limit):
-              global downloaded_bytes
-              with open(file_path, "r+b") as f:
-                  f.seek(offset)
-                  try:
-                      # اضافه کردن request_size برای جلوگیری از هنگ کردن تلگرام
-                      async for chunk in client.iter_download(message.media, offset=offset, limit=limit, request_size=1024*1024):
-                          if not chunk:
-                              break
-                          f.write(chunk)
-                          downloaded_bytes += len(chunk)
-                          # اگر از حجم فایل عبور کردیم، به زور خارج شو
-                          if downloaded_bytes >= message.file.size:
-                              break
-                  except Exception as e:
-                      print(f"   ⚠️ Chunk finished with message: {e}")
+          # تابع بررسی سلامت فایل با ffmpeg
+          def is_video_valid(file_path):
+              try:
+                  # تست ۳ ثانیه از ویدیو
+                  subprocess.run(
+                      ["ffmpeg", "-v", "error", "-i", str(file_path), "-t", "3", "-f", "null", "-"],
+                      check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                  )
+                  return True
+              except subprocess.CalledProcessError:
+                  return False
 
-          async def monitor_progress(total_size):
-              global downloaded_bytes
-              last_mb = 0
-              start_time = time.time()
-              # تغییر شرط به <= تا اگر از حجم اصلی هم رد شد، متوقف نشود
-              while downloaded_bytes <= total_size:
-                  await asyncio.sleep(1)
-                  current_mb = downloaded_bytes / (1024 * 1024)
-                  if current_mb - last_mb >= 10 or downloaded_bytes >= total_size:
-                      last_mb = current_mb
-                      elapsed = time.time() - start_time
-                      speed = current_mb / elapsed if elapsed > 0 else 0
-                      percent = (downloaded_bytes / total_size) * 100
-                      print(f"   ⬇️ Progress: {percent:.1f}% ({current_mb:.1f}/{total_size/(1024*1024):.1f} MB) | Speed: {speed:.2f} MB/s", flush=True)
-
-          async def main():
-              global downloaded_bytes
-              client = TelegramClient(StringSession(session_str), api_id, api_hash)
-              await client.start()
+          print("Connecting to Telegram...")
+          with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
               
               messages_to_download = []
-              print(f"Searching for the latest {count} videos/files in Saved Messages...")
-              async for msg in client.iter_messages('me', limit=100):
+              print(f"Searching for the latest {count} files in Saved Messages...")
+              
+              # گرفتن پیام‌ها
+              for msg in client.get_messages('me', limit=100):
                   if msg.media and (msg.video or msg.document):
                       messages_to_download.append(msg)
                       if len(messages_to_download) >= count:
@@ -108,51 +86,48 @@ jobs:
                   sys.exit(1)
 
               total_files = len(messages_to_download)
-              print(f"✅ Found {total_files} file(s). Downloading with 10 parallel threads each...")
+              print(f"✅ Found {total_files} file(s).")
               print("========================================")
 
               for i, message in enumerate(messages_to_download, 1):
                   file_name = message.file.name or f"Unknown_{i}.mp4"
-                  file_size = message.file.size
-                  file_size_mb = file_size / 1024 / 1024
+                  file_size_mb = message.file.size / 1024 / 1024
                   remaining = total_files - i
                   
                   print(f"\n[{i}/{total_files}] {file_name}")
                   print(f"📊 {i-1} downloaded, {remaining} remaining | Size: {file_size_mb:.2f} MB")
                   
                   file_path = out_dir / file_name
+                  max_retries = 3
+                  success = False
                   
-                  with open(file_path, "wb") as f:
-                      f.truncate(file_size)
-                      
-                  downloaded_bytes = 0 
+                  for attempt in range(1, max_retries + 1):
+                      if file_path.exists():
+                          file_path.unlink() # پاک کردن دانلود ناقص قبلی
+                          
+                      print(f"   ⬇️ Downloading (Attempt {attempt}/{max_retries})...")
+                      try:
+                          # دانلود تک‌ترده و استاندارد (بسیار پایدار)
+                          client.download_media(message, file=str(file_path))
+                          
+                          print(f"   🔍 Validating file...")
+                          if is_video_valid(file_path):
+                              print(f"   ✅ File is valid and healthy!")
+                              success = True
+                              break
+                          else:
+                              print(f"   ❌ File is corrupted (moov atom missing). Retrying...")
+                      except Exception as e:
+                          print(f"   ⚠️ Error: {e}. Retrying...")
                   
-                  threads = 10
-                  part_size = file_size // threads
-                  tasks = []
+                  if not success:
+                      print(f"   🚨 Failed to download a healthy version of {file_name} after {max_retries} attempts.")
+                      if file_path.exists():
+                          file_path.unlink() # فایل خراب رو پاک کن که آپلود نشه
                   
-                  for t in range(threads):
-                      offset = t * part_size
-                      limit = part_size if t < threads - 1 else file_size - offset
-                      tasks.append(download_chunk(client, message, file_path, offset, limit))
-                  
-                  # استفاده از try در گَدر برای اینکه اگه یه ترد هنگ کرد، کل کار متوقف نشه
-                  try:
-                      await asyncio.wait_for(asyncio.gather(monitor_progress(file_size), *tasks), timeout=file_size_mb / 0.5) 
-                      # تایم اوت: اگر سرعت از 0.5 مگابایت بر ثانیه کمتر شد، کد رو رد کن
-                  except asyncio.TimeoutError:
-                      print("\n   ⚠️ Download Timeout reached. Forcing completion.")
-                  except Exception as e:
-                      print(f"\n   ⚠️ Download finished with exception: {e}")
-                  
-                  print(f"   ✅ Downloaded successfully: {file_name}")
                   print("-" * 50)
-                  
-              await client.disconnect()
-              print("\n🎉 All downloads completed!")
 
-          if __name__ == "__main__":
-              asyncio.run(main())
+          print("\n🎉 Process completed!")
           PY
 
       - name: Upload to Release
@@ -161,11 +136,11 @@ jobs:
           tag_name: ${{ inputs.tag }}
           name: ${{ inputs.tag }}
           files: files/*
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false # اگر هیچ فایلی سالم نبود، خطا نده
 
       - name: Print download links
         run: |
-          echo "### 🔗 لینک‌های دانلود" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 لینک‌های دانلود (سالم)" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           for file in files/*; do
             if [ -f "$file" ]; then
