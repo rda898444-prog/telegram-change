@@ -1,4 +1,4 @@
-name: Download from Telegram (Safe & Reliable)
+name: Download Parallel & Safe (4 Servers)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       count:
         description: 'تعداد فیلم‌هایی که باید دانلود شوند'
         required: true
-        default: '5'
+        default: '8'
         type: string
       tag:
         description: 'Release tag (مثلاً v1)'
@@ -18,9 +18,63 @@ permissions:
   contents: write
 
 jobs:
-  download:
+  # مرحله ۱: پیدا کردن لیست فیلم‌ها از تلگرام
+  get-messages:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install telethon
+        run: pip install telethon
+      
+      - name: Fetch latest files
+        id: set-matrix
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.TELEGRAM_SESSION }}
+          COUNT: ${{ inputs.count }}
+        run: |
+          python - <<'PY'
+          import os, json, sys
+          from telethon.sync import TelegramClient
+          from telethon.sessions import StringSession
+
+          client = TelegramClient(StringSession(os.environ["SESSION_STRING"]), int(os.environ["API_ID"]), os.environ["API_HASH"])
+          client.start()
+          
+          count = int(os.environ["COUNT"])
+          msgs = []
+          for msg in client.get_messages('me', limit=100):
+              if msg.media and (msg.video or msg.document):
+                  name = msg.file.name or f"Video_{msg.id}.mp4"
+                  msgs.append({"id": msg.id, "name": name})
+                  if len(msgs) >= count:
+                      break
+                      
+          if not msgs:
+              print("No files found!")
+              sys.exit(1)
+              
+          # ساخت JSON برای Matrix
+          matrix_json = json.dumps({"video": msgs})
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"matrix={matrix_json}\n")
+          PY
+
+  # مرحله ۲: دانلود موازی روی ۴ سرور
+  download-video:
+    needs: get-messages
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    strategy:
+      max-parallel: 4 # حداکثر ۴ سرور همزمان
+      fail-fast: false # اگر یکی خراب شد، بقیه ادامه بدن
+      matrix: ${{ fromJson(needs.get-messages.outputs.matrix) }}
     steps:
       - name: Setup Python & ffmpeg
         uses: actions/setup-python@v5
@@ -33,123 +87,143 @@ jobs:
           sudo apt-get install -y ffmpeg
           pip install telethon cryptg
 
-      - name: Download Safely from Telegram
+      - name: Download and Validate
+        id: dl
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           SESSION_STRING: ${{ secrets.TELEGRAM_SESSION }}
-          COUNT: ${{ inputs.count }}
+          MSG_ID: ${{ matrix.video.id }}
+          FILE_NAME: ${{ matrix.video.name }}
         run: |
           python - <<'PY'
-          import os
-          import sys
-          import subprocess
+          import os, sys, subprocess, time
           from pathlib import Path
           from telethon.sync import TelegramClient
           from telethon.sessions import StringSession
 
-          api_id = int(os.environ["API_ID"])
-          api_hash = os.environ["API_HASH"]
-          session_str = os.environ["SESSION_STRING"]
-          count = int(os.environ.get("COUNT", "5"))
+          msg_id = int(os.environ["MSG_ID"])
+          file_name = os.environ["FILE_NAME"]
+          file_path = Path("files") / file_name
+          file_path.parent.mkdir(exist_ok=True)
 
-          out_dir = Path("files")
-          out_dir.mkdir(exist_ok=True)
+          client = TelegramClient(StringSession(os.environ["SESSION_STRING"]), int(os.environ["API_ID"]), os.environ["API_HASH"])
+          client.start()
 
-          # تابع بررسی سلامت فایل با ffmpeg
-          def is_video_valid(file_path):
+          print(f"🎬 Processing: {file_name} (ID: {msg_id})")
+          message = client.get_messages('me', ids=msg_id)
+          
+          if not message:
+              print(f"❌ Error: Message {msg_id} not found.")
+              sys.exit(1)
+
+          max_retries = 30
+          retry_count = 0
+          success = False
+
+          while retry_count < max_retries:
               try:
-                  # تست ۳ ثانیه از ویدیو
-                  subprocess.run(
-                      ["ffmpeg", "-v", "error", "-i", str(file_path), "-t", "3", "-f", "null", "-"],
-                      check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                  current_size = file_path.stat().st_size if file_path.exists() else 0
+                  if current_size > 0:
+                      print(f"   🔄 Resuming from {current_size / (1024*1024):.1f} MB... (Attempt {retry_count+1}/{max_retries})")
+                  else:
+                      print(f"   ⬇️ Starting download... (Attempt {retry_count+1}/{max_retries})")
+                      
+                  # دانلود با قابلیت Resume
+                  with open(file_path, "ab") as f:
+                      for chunk in client.iter_download(message.media, offset=current_size):
+                          f.write(chunk)
+                  
+                  # تست سلامت فایل
+                  print(f"   🔍 Validating file...")
+                  result = subprocess.run(
+                      ["ffmpeg", "-v", "error", "-i", str(file_path), "-t", "5", "-f", "null", "-"],
+                      capture_output=True
                   )
-                  return True
-              except subprocess.CalledProcessError:
-                  return False
+                  
+                  if result.returncode == 0:
+                      print(f"   ✅ File is valid and healthy!")
+                      success = True
+                      break
+                  else:
+                      print(f"   ❌ File is corrupted. Restarting download...")
+                      file_path.unlink() # پاک کردن فایل خراب
+                      retry_count += 1
+                      
+              except Exception as e:
+                  retry_count += 1
+                  print(f"   ⚠️ Connection dropped: {e}")
+                  print(f"   ⏳ Waiting 10 seconds before retrying...")
+                  time.sleep(10)
 
-          print("Connecting to Telegram...")
-          with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
-              
-              messages_to_download = []
-              print(f"Searching for the latest {count} files in Saved Messages...")
-              
-              # گرفتن پیام‌ها
-              for msg in client.get_messages('me', limit=100):
-                  if msg.media and (msg.video or msg.document):
-                      messages_to_download.append(msg)
-                      if len(messages_to_download) >= count:
-                          break
-                          
-              if not messages_to_download:
-                  print("❌ خطا: هیچ فایلی پیدا نشد.")
-                  sys.exit(1)
-
-              total_files = len(messages_to_download)
-              print(f"✅ Found {total_files} file(s).")
-              print("========================================")
-
-              for i, message in enumerate(messages_to_download, 1):
-                  file_name = message.file.name or f"Unknown_{i}.mp4"
-                  file_size_mb = message.file.size / 1024 / 1024
-                  remaining = total_files - i
-                  
-                  print(f"\n[{i}/{total_files}] {file_name}")
-                  print(f"📊 {i-1} downloaded, {remaining} remaining | Size: {file_size_mb:.2f} MB")
-                  
-                  file_path = out_dir / file_name
-                  max_retries = 3
-                  success = False
-                  
-                  for attempt in range(1, max_retries + 1):
-                      if file_path.exists():
-                          file_path.unlink() # پاک کردن دانلود ناقص قبلی
-                          
-                      print(f"   ⬇️ Downloading (Attempt {attempt}/{max_retries})...")
-                      try:
-                          # دانلود تک‌ترده و استاندارد (بسیار پایدار)
-                          client.download_media(message, file=str(file_path))
-                          
-                          print(f"   🔍 Validating file...")
-                          if is_video_valid(file_path):
-                              print(f"   ✅ File is valid and healthy!")
-                              success = True
-                              break
-                          else:
-                              print(f"   ❌ File is corrupted (moov atom missing). Retrying...")
-                      except Exception as e:
-                          print(f"   ⚠️ Error: {e}. Retrying...")
-                  
-                  if not success:
-                      print(f"   🚨 Failed to download a healthy version of {file_name} after {max_retries} attempts.")
-                      if file_path.exists():
-                          file_path.unlink() # فایل خراب رو پاک کن که آپلود نشه
-                  
-                  print("-" * 50)
-
-          print("\n🎉 Process completed!")
+          if success:
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("status=SUCCESS\n")
+              # ساخت فایل وضعیت برای گزارش نهایی
+              Path("status.txt").write_text(f"SUCCESS: {file_name}")
+          else:
+              print(f"   🚨 Failed after {max_retries} attempts.")
+              if file_path.exists():
+                  file_path.unlink()
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("status=FAILED\n")
+              Path("status.txt").write_text(f"FAILED: {file_name}")
+              sys.exit(1)
           PY
 
       - name: Upload to Release
+        if: steps.dl.outputs.status == 'SUCCESS'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
-          name: ${{ inputs.tag }}
           files: files/*
-          fail_on_unmatched_files: false # اگر هیچ فایلی سالم نبود، خطا نده
+          fail_on_unmatched_files: true
+
+      - name: Upload status artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: status-${{ matrix.video.id }}
+          path: status.txt
+          retention-days: 1
+
+  # مرحله ۳: ساخت گزارش نهایی
+  report:
+    needs: download-video
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all status logs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: status-*
+          merge-multiple: true
+          path: logs
+
+      - name: Print Final Summary
+        run: |
+          echo "### 📊 گزارش نهایی دانلود" >> $GITHUB_STEP_SUMMARY
+          
+          if [ ! -d "logs" ]; then
+            echo "هیچ لاگی یافت نشد." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          echo "✅ **فایل‌های موفق:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep "^SUCCESS:" logs/*.txt | sed 's/.*SUCCESS: //' >> $GITHUB_STEP_SUMMARY || echo "هیچ فایلی موفق نبود." >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "❌ **فایل‌های ناموفق:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep "^FAILED:" logs/*.txt | sed 's/.*FAILED: //' >> $GITHUB_STEP_SUMMARY || echo "🎉 همه فایل‌ها موفق بودند!" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Print download links
         run: |
-          echo "### 🔗 لینک‌های دانلود (سالم)" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          for file in files/*; do
-            if [ -f "$file" ]; then
-              FILENAME=$(basename "$file")
-              URL_FILENAME=$(echo "$FILENAME" | sed 's/ /%20/g')
-              LINK="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/$URL_FILENAME"
-              echo "**$FILENAME**" >> $GITHUB_STEP_SUMMARY
-              echo "$LINK" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-            fi
-          done
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 لینک‌های دانلود" >> $GITHUB_STEP_SUMMARY
+          echo "برای دریافت فایل‌های موفق، به بخش Releases بروید." >> $GITHUB_STEP_SUMMARY
+          LINK="https://github.com/${{ github.repository }}/releases/tag/${{ inputs.tag }}"
+          echo "[کلیک کنید تا به Releases بروید]($LINK)" >> $GITHUB_STEP_SUMMARY
