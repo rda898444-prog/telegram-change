@@ -8,10 +8,6 @@ on:
         required: true
         default: '5'
         type: string
-      msg_id:
-        description: 'شماره پیام خاص (اختیاری)'
-        required: false
-        type: string
       tag:
         description: 'Release tag (مثلاً v1)'
         required: true
@@ -40,7 +36,6 @@ jobs:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           SESSION_STRING: ${{ secrets.TELEGRAM_SESSION }}
-          MSG_ID: ${{ inputs.msg_id }}
           COUNT: ${{ inputs.count }}
         run: |
           python - <<'PY'
@@ -55,33 +50,40 @@ jobs:
           api_id = int(os.environ["API_ID"])
           api_hash = os.environ["API_HASH"]
           session_str = os.environ["SESSION_STRING"]
-          msg_id_str = os.environ.get("MSG_ID", "").strip()
           count = int(os.environ.get("COUNT", "5"))
 
           out_dir = Path("files")
           out_dir.mkdir(exist_ok=True)
           
-          # متغیرهای سراسری برای پیشرفت
           downloaded_bytes = 0
 
-          # دانلود یک تکه از فایل
+          # اصلاح باگ گیر کردن روی ۱۰۰٪
           async def download_chunk(client, message, file_path, offset, limit):
               global downloaded_bytes
               with open(file_path, "r+b") as f:
                   f.seek(offset)
-                  async for chunk in client.iter_download(message.media, offset=offset, limit=limit):
-                      f.write(chunk)
-                      downloaded_bytes += len(chunk)
+                  try:
+                      # اضافه کردن request_size برای جلوگیری از هنگ کردن تلگرام
+                      async for chunk in client.iter_download(message.media, offset=offset, limit=limit, request_size=1024*1024):
+                          if not chunk:
+                              break
+                          f.write(chunk)
+                          downloaded_bytes += len(chunk)
+                          # اگر از حجم فایل عبور کردیم، به زور خارج شو
+                          if downloaded_bytes >= message.file.size:
+                              break
+                  except Exception as e:
+                      print(f"   ⚠️ Chunk finished with message: {e}")
 
-          # نمایش پیشرفت و سرعت هر ۱۰ مگابایت
           async def monitor_progress(total_size):
               global downloaded_bytes
               last_mb = 0
               start_time = time.time()
-              while downloaded_bytes < total_size:
+              # تغییر شرط به <= تا اگر از حجم اصلی هم رد شد، متوقف نشود
+              while downloaded_bytes <= total_size:
                   await asyncio.sleep(1)
                   current_mb = downloaded_bytes / (1024 * 1024)
-                  if current_mb - last_mb >= 10 or downloaded_bytes == total_size:
+                  if current_mb - last_mb >= 10 or downloaded_bytes >= total_size:
                       last_mb = current_mb
                       elapsed = time.time() - start_time
                       speed = current_mb / elapsed if elapsed > 0 else 0
@@ -94,24 +96,13 @@ jobs:
               await client.start()
               
               messages_to_download = []
-              
-              if msg_id_str:
-                  try:
-                      msg_id = int(msg_id_str)
-                      msg = await client.get_messages('me', ids=msg_id)
-                      if msg and msg.media:
-                          messages_to_download.append(msg)
-                  except ValueError:
-                      pass
-              
-              if not messages_to_download:
-                  print(f"Searching for the latest {count} videos/files in Saved Messages...")
-                  async for msg in client.iter_messages('me', limit=100):
-                      if msg.media and (msg.video or msg.document):
-                          messages_to_download.append(msg)
-                          if len(messages_to_download) >= count:
-                              break
-                              
+              print(f"Searching for the latest {count} videos/files in Saved Messages...")
+              async for msg in client.iter_messages('me', limit=100):
+                  if msg.media and (msg.video or msg.document):
+                      messages_to_download.append(msg)
+                      if len(messages_to_download) >= count:
+                          break
+                          
               if not messages_to_download:
                   print("❌ خطا: هیچ فایلی پیدا نشد.")
                   sys.exit(1)
@@ -131,24 +122,28 @@ jobs:
                   
                   file_path = out_dir / file_name
                   
-                  # ایجاد فایل خالی با حجم نهایی برای رزرو فضا
                   with open(file_path, "wb") as f:
                       f.truncate(file_size)
                       
-                  downloaded_bytes = 0 # ریست کردن برای فایل جدید
+                  downloaded_bytes = 0 
                   
                   threads = 10
                   part_size = file_size // threads
                   tasks = []
                   
-                  # تقسیم فایل به ۱۰ بخش و ساخت تسک برای هر کدام
                   for t in range(threads):
                       offset = t * part_size
                       limit = part_size if t < threads - 1 else file_size - offset
                       tasks.append(download_chunk(client, message, file_path, offset, limit))
-                      
-                  # اجرای همزمان ۱۰ تسک + مانیتور پیشرفت
-                  await asyncio.gather(monitor_progress(file_size), *tasks)
+                  
+                  # استفاده از try در گَدر برای اینکه اگه یه ترد هنگ کرد، کل کار متوقف نشه
+                  try:
+                      await asyncio.wait_for(asyncio.gather(monitor_progress(file_size), *tasks), timeout=file_size_mb / 0.5) 
+                      # تایم اوت: اگر سرعت از 0.5 مگابایت بر ثانیه کمتر شد، کد رو رد کن
+                  except asyncio.TimeoutError:
+                      print("\n   ⚠️ Download Timeout reached. Forcing completion.")
+                  except Exception as e:
+                      print(f"\n   ⚠️ Download finished with exception: {e}")
                   
                   print(f"   ✅ Downloaded successfully: {file_name}")
                   print("-" * 50)
@@ -177,9 +172,6 @@ jobs:
               FILENAME=$(basename "$file")
               URL_FILENAME=$(echo "$FILENAME" | sed 's/ /%20/g')
               LINK="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/$URL_FILENAME"
-              echo "**$FILENAME**"
-              echo "$LINK"
-              echo ""
               echo "**$FILENAME**" >> $GITHUB_STEP_SUMMARY
               echo "$LINK" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
