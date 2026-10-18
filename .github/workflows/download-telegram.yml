@@ -1,4 +1,4 @@
-name: Download Multiple (Parallel 10 Threads)
+name: Download Multiple (10 Parallel Threads)
 
 on:
   workflow_dispatch:
@@ -31,11 +31,11 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install telescraper and cryptg (for speed)
+      - name: Install telethon and cryptg
         run: |
-          pip install telescraper cryptg
+          pip install telethon cryptg
 
-      - name: Download from Telegram (Parallel)
+      - name: Download from Telegram (10 Threads)
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
@@ -46,10 +46,11 @@ jobs:
           python - <<'PY'
           import os
           import sys
+          import asyncio
           import time
           from pathlib import Path
+          from telethon import TelegramClient
           from telethon.sessions import StringSession
-          from telescraper import TeleScraper
 
           api_id = int(os.environ["API_ID"])
           api_hash = os.environ["API_HASH"]
@@ -59,72 +60,104 @@ jobs:
 
           out_dir = Path("files")
           out_dir.mkdir(exist_ok=True)
-          messages_to_download = []
+          
+          # متغیرهای سراسری برای پیشرفت
+          downloaded_bytes = 0
 
-          # اتصال با استفاده از StringSession سازگار با Telethon
-          print("Connecting to Telegram (telescraper)...")
-          client = TeleScraper(StringSession(session_str), api_id=api_id, api_hash=api_hash)
-          client.start()
+          # دانلود یک تکه از فایل
+          async def download_chunk(client, message, file_path, offset, limit):
+              global downloaded_bytes
+              with open(file_path, "r+b") as f:
+                  f.seek(offset)
+                  async for chunk in client.iter_download(message.media, offset=offset, limit=limit):
+                      f.write(chunk)
+                      downloaded_bytes += len(chunk)
 
-          # --- پیدا کردن پیام‌ها ---
-          if msg_id_str:
-              try:
-                  msg_id = int(msg_id_str)
-                  msg = client.get_messages('me', ids=msg_id)
-                  if msg and msg.media:
-                      messages_to_download.append(msg)
-              except ValueError:
-                  pass
-
-          if not messages_to_download:
-              print(f"Searching for the latest {count} videos/files in Saved Messages...")
-              recent = client.get_messages('me', limit=100)
-              for msg in recent:
-                  if msg.media and (msg.video or msg.document):
-                      messages_to_download.append(msg)
-                      if len(messages_to_download) >= count:
-                          break
-
-          if not messages_to_download:
-              print("❌ خطا: هیچ فایلی پیدا نشد.")
-              sys.exit(1)
-
-          total_files = len(messages_to_download)
-          print(f"✅ Found {total_files} file(s). Downloading with 10 parallel threads each...")
-          print("========================================")
-
-          for i, message in enumerate(messages_to_download, 1):
-              file_name = message.file.name or f"Unknown_{i}.mp4"
-              file_size = message.file.size / 1024 / 1024
-              remaining = total_files - i
-              
-              print(f"\n[{i}/{total_files}] {file_name}")
-              print(f"📊 {i-1} downloaded, {remaining} remaining | Size: {file_size:.2f} MB")
-
-              # ثبت زمان شروع برای محاسبه سرعت (تقریبی)
+          # نمایش پیشرفت و سرعت هر ۱۰ مگابایت
+          async def monitor_progress(total_size):
+              global downloaded_bytes
+              last_mb = 0
               start_time = time.time()
+              while downloaded_bytes < total_size:
+                  await asyncio.sleep(1)
+                  current_mb = downloaded_bytes / (1024 * 1024)
+                  if current_mb - last_mb >= 10 or downloaded_bytes == total_size:
+                      last_mb = current_mb
+                      elapsed = time.time() - start_time
+                      speed = current_mb / elapsed if elapsed > 0 else 0
+                      percent = (downloaded_bytes / total_size) * 100
+                      print(f"   ⬇️ Progress: {percent:.1f}% ({current_mb:.1f}/{total_size/(1024*1024):.1f} MB) | Speed: {speed:.2f} MB/s", flush=True)
 
-              # دانلود موازی با ۱۰ ترد
-              try:
-                  downloaded_path = client.download_parallel(
-                      message, 
-                      output_dir=str(out_dir), 
-                      num_threads=10  # <--- تعداد تردهای موازی
-                  )
+          async def main():
+              global downloaded_bytes
+              client = TelegramClient(StringSession(session_str), api_id, api_hash)
+              await client.start()
+              
+              messages_to_download = []
+              
+              if msg_id_str:
+                  try:
+                      msg_id = int(msg_id_str)
+                      msg = await client.get_messages('me', ids=msg_id)
+                      if msg and msg.media:
+                          messages_to_download.append(msg)
+                  except ValueError:
+                      pass
+              
+              if not messages_to_download:
+                  print(f"Searching for the latest {count} videos/files in Saved Messages...")
+                  async for msg in client.iter_messages('me', limit=100):
+                      if msg.media and (msg.video or msg.document):
+                          messages_to_download.append(msg)
+                          if len(messages_to_download) >= count:
+                              break
+                              
+              if not messages_to_download:
+                  print("❌ خطا: هیچ فایلی پیدا نشد.")
+                  sys.exit(1)
+
+              total_files = len(messages_to_download)
+              print(f"✅ Found {total_files} file(s). Downloading with 10 parallel threads each...")
+              print("========================================")
+
+              for i, message in enumerate(messages_to_download, 1):
+                  file_name = message.file.name or f"Unknown_{i}.mp4"
+                  file_size = message.file.size
+                  file_size_mb = file_size / 1024 / 1024
+                  remaining = total_files - i
                   
-                  elapsed = time.time() - start_time
-                  speed = file_size / elapsed if elapsed > 0 else 0
+                  print(f"\n[{i}/{total_files}] {file_name}")
+                  print(f"📊 {i-1} downloaded, {remaining} remaining | Size: {file_size_mb:.2f} MB")
                   
-                  if downloaded_path:
-                      print(f"   ✅ Done in {elapsed:.1f}s | Avg Speed: {speed:.2f} MB/s")
-                  else:
-                      print(f"   ❌ Failed: {file_name}")
-              except Exception as e:
-                  print(f"   ❌ Error downloading {file_name}: {e}")
+                  file_path = out_dir / file_name
+                  
+                  # ایجاد فایل خالی با حجم نهایی برای رزرو فضا
+                  with open(file_path, "wb") as f:
+                      f.truncate(file_size)
+                      
+                  downloaded_bytes = 0 # ریست کردن برای فایل جدید
+                  
+                  threads = 10
+                  part_size = file_size // threads
+                  tasks = []
+                  
+                  # تقسیم فایل به ۱۰ بخش و ساخت تسک برای هر کدام
+                  for t in range(threads):
+                      offset = t * part_size
+                      limit = part_size if t < threads - 1 else file_size - offset
+                      tasks.append(download_chunk(client, message, file_path, offset, limit))
+                      
+                  # اجرای همزمان ۱۰ تسک + مانیتور پیشرفت
+                  await asyncio.gather(monitor_progress(file_size), *tasks)
+                  
+                  print(f"   ✅ Downloaded successfully: {file_name}")
+                  print("-" * 50)
+                  
+              await client.disconnect()
+              print("\n🎉 All downloads completed!")
 
-              print("-" * 50)
-
-          print("\n🎉 All downloads completed!")
+          if __name__ == "__main__":
+              asyncio.run(main())
           PY
 
       - name: Upload to Release
