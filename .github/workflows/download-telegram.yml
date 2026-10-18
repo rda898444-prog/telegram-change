@@ -1,15 +1,15 @@
-name: Download Multiple from Saved Messages
+name: Download Multiple (Parallel 10 Threads)
 
 on:
   workflow_dispatch:
     inputs:
       count:
-        description: 'تعداد فیلم‌هایی که باید دانلود شوند (اگر msg_id خالی باشد)'
+        description: 'تعداد فیلم‌هایی که باید دانلود شوند'
         required: true
         default: '5'
         type: string
       msg_id:
-        description: 'شماره پیام خاص (اختیاری - اگر پر شود، فقط همان را دانلود می‌کند)'
+        description: 'شماره پیام خاص (اختیاری)'
         required: false
         type: string
       tag:
@@ -31,10 +31,11 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Telethon
-        run: pip install telethon
+      - name: Install telescraper and cryptg (for speed)
+        run: |
+          pip install telescraper cryptg
 
-      - name: Download from Telegram
+      - name: Download from Telegram (Parallel)
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
@@ -47,8 +48,8 @@ jobs:
           import sys
           import time
           from pathlib import Path
-          from telethon.sync import TelegramClient
           from telethon.sessions import StringSession
+          from telescraper import TeleScraper
 
           api_id = int(os.environ["API_ID"])
           api_hash = os.environ["API_HASH"]
@@ -60,84 +61,68 @@ jobs:
           out_dir.mkdir(exist_ok=True)
           messages_to_download = []
 
-          print("Connecting to Telegram...")
-          with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
+          # اتصال با استفاده از StringSession سازگار با Telethon
+          print("Connecting to Telegram (telescraper)...")
+          client = TeleScraper(StringSession(session_str), api_id=api_id, api_hash=api_hash)
+          client.start()
+
+          # --- پیدا کردن پیام‌ها ---
+          if msg_id_str:
+              try:
+                  msg_id = int(msg_id_str)
+                  msg = client.get_messages('me', ids=msg_id)
+                  if msg and msg.media:
+                      messages_to_download.append(msg)
+              except ValueError:
+                  pass
+
+          if not messages_to_download:
+              print(f"Searching for the latest {count} videos/files in Saved Messages...")
+              recent = client.get_messages('me', limit=100)
+              for msg in recent:
+                  if msg.media and (msg.video or msg.document):
+                      messages_to_download.append(msg)
+                      if len(messages_to_download) >= count:
+                          break
+
+          if not messages_to_download:
+              print("❌ خطا: هیچ فایلی پیدا نشد.")
+              sys.exit(1)
+
+          total_files = len(messages_to_download)
+          print(f"✅ Found {total_files} file(s). Downloading with 10 parallel threads each...")
+          print("========================================")
+
+          for i, message in enumerate(messages_to_download, 1):
+              file_name = message.file.name or f"Unknown_{i}.mp4"
+              file_size = message.file.size / 1024 / 1024
+              remaining = total_files - i
               
-              # --- حالت اول: اگر شماره پیام خاصی وارد شده باشد ---
-              if msg_id_str:
-                  try:
-                      msg_id = int(msg_id_str)
-                      print(f"Looking for specific Message ID: {msg_id}...")
-                      msg = client.get_messages('me', ids=msg_id)
-                      if msg and msg.media:
-                          messages_to_download.append(msg)
-                      else:
-                          print(f"⚠️ پیام {msg_id} پیدا نشد یا فایل نبود. جستجو برای جدیدترین‌ها...")
-                  except ValueError:
-                      print("⚠️ فرمت آیدی نامعتبر است.")
+              print(f"\n[{i}/{total_files}] {file_name}")
+              print(f"📊 {i-1} downloaded, {remaining} remaining | Size: {file_size:.2f} MB")
 
-              # --- حالت دوم: پیدا کردن N فیلم آخر ---
-              if not messages_to_download:
-                  print(f"Searching for the latest {count} videos/files in Saved Messages...")
-                  recent_messages = client.get_messages('me', limit=100)
-                  
-                  for msg in recent_messages:
-                      if msg.media and (msg.video or msg.document):
-                          messages_to_download.append(msg)
-                          if len(messages_to_download) >= count:
-                              break
+              # ثبت زمان شروع برای محاسبه سرعت (تقریبی)
+              start_time = time.time()
 
-              if not messages_to_download:
-                  print("❌ خطا: هیچ فایل یا ویدیویی پیدا نشد.")
-                  sys.exit(1)
-
-              total_files = len(messages_to_download)
-              print(f"✅ Found {total_files} file(s) to download.")
-              print("========================================")
-
-              # حلقه دانلود فایل‌ها
-              for i, message in enumerate(messages_to_download, 1):
-                  file_name = message.file.name or f"Unknown_Video_{i}.mp4"
-                  file_size = message.file.size / 1024 / 1024
-                  
-                  # محاسبه تعداد دانلود شده و باقی‌مانده
-                  downloaded_count = i - 1
-                  remaining_count = total_files - i
-
-                  print(f"\n[{i}/{total_files}] Downloading: {file_name}")
-                  print(f"📊 Status: {downloaded_count} downloaded, {remaining_count} remaining")
-                  print(f"⚖️ Size: {file_size:.2f} MB | ID: {message.id}")
-                  
-                  # تنظیمات محاسبه سرعت و پیشرفت
-                  start_time = time.time()
-                  progress_state = {"last_mb": 0}
-                  
-                  def progress_callback(current, total):
-                      current_mb = current / (1024 * 1024)
-                      total_mb = total / (1024 * 1024)
-                      
-                      # محاسبه سرعت
-                      elapsed_time = time.time() - start_time
-                      speed_mb_s = current_mb / elapsed_time if elapsed_time > 0 else 0
-
-                      # چاپ هر ۱۰ مگابایت یکبار
-                      if current_mb - progress_state["last_mb"] >= 10 or current == total:
-                          progress_state["last_mb"] = current_mb
-                          percent = (current / total) * 100
-                          print(f"   ⬇️ Progress: {percent:.1f}% ({current_mb:.1f}/{total_mb:.1f} MB) | Speed: {speed_mb_s:.2f} MB/s", flush=True)
-
-                  downloaded_path = client.download_media(
+              # دانلود موازی با ۱۰ ترد
+              try:
+                  downloaded_path = client.download_parallel(
                       message, 
-                      file=str(out_dir) + "/",
-                      progress_callback=progress_callback
+                      output_dir=str(out_dir), 
+                      num_threads=10  # <--- تعداد تردهای موازی
                   )
                   
-                  if downloaded_path:
-                      print(f"   ✅ Downloaded successfully: {os.path.basename(downloaded_path)}")
-                  else:
-                      print(f"   ❌ Failed to download: {file_name}")
+                  elapsed = time.time() - start_time
+                  speed = file_size / elapsed if elapsed > 0 else 0
                   
-                  print("-" * 50)
+                  if downloaded_path:
+                      print(f"   ✅ Done in {elapsed:.1f}s | Avg Speed: {speed:.2f} MB/s")
+                  else:
+                      print(f"   ❌ Failed: {file_name}")
+              except Exception as e:
+                  print(f"   ❌ Error downloading {file_name}: {e}")
+
+              print("-" * 50)
 
           print("\n🎉 All downloads completed!")
           PY
@@ -154,21 +139,17 @@ jobs:
         run: |
           echo "### 🔗 لینک‌های دانلود" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          
           for file in files/*; do
             if [ -f "$file" ]; then
               FILENAME=$(basename "$file")
               URL_FILENAME=$(echo "$FILENAME" | sed 's/ /%20/g')
               LINK="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/$URL_FILENAME"
-              
-              echo "فایل: $FILENAME"
+              echo "**$FILENAME**"
               echo "$LINK"
               echo ""
-              
               echo "**$FILENAME**" >> $GITHUB_STEP_SUMMARY
               echo "$LINK" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
             fi
           done
-          
           echo '```' >> $GITHUB_STEP_SUMMARY
