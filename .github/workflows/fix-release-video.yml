@@ -1,4 +1,4 @@
-name: Fix moov in Release
+name: Fix moov for All Videos in Release
 
 on:
   workflow_dispatch:
@@ -8,62 +8,98 @@ on:
         required: true
         default: 'v1'
         type: string
-      filename:
-        description: 'اسم دقیق فایل در Release (مثلاً In_the_Realm.mp4)'
+      max_parallel:
+        description: 'تعداد سرورهایی که همزمان کار کنند (پیشنهاد: 4)'
         required: true
+        default: '4'
         type: string
 
 permissions:
   contents: write
 
 jobs:
-  fix-video:
+  # مرحله ۱: پیدا کردن لیست تمام ویدیوها
+  get-videos:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Get video list
+        id: set-matrix
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Fetching video list from tag: ${{ inputs.tag }}"
+          FILES=$(gh release view "${{ inputs.tag }}" --repo ${{ github.repository }} --json assets \
+            --jq '[.assets[].name | select(test("\\.(mp4|mov|m4v)$"))] | tostring')
+          
+          if [ "$FILES" == "[]" ] || [ -z "$FILES" ]; then
+            echo "❌ No MP4/MOV files found in this release."
+            exit 1
+          fi
+          
+          echo "matrix={\"file\":$FILES}" >> $GITHUB_OUTPUT
 
+  # مرحله ۲: اصلاح moov (هر فیلم روی یک سرور)
+  fix-moov:
+    needs: get-videos
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      max-parallel: ${{ fromJson(inputs.max_parallel) }}
+      fail-fast: false
+      matrix: ${{ fromJson(needs.get-videos.outputs.matrix) }}
+    steps:
       - name: Install ffmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Download file from Release
+      - name: Download, Fix moov, Replace
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FILENAME: ${{ matrix.file }}
+          TAG: ${{ inputs.tag }}
         run: |
-          echo "Downloading ${{ inputs.filename }} from release ${{ inputs.tag }}..."
-          gh release download ${{ inputs.tag }} --pattern "${{ inputs.filename }}" --output "original_file.mp4"
-
-      - name: Fix moov (Faststart)
-        run: |
-          echo "🔧 Moving moov atom to the front..."
-          ffmpeg -y -hide_banner -loglevel error -i "original_file.mp4" -c copy -movflags +faststart "fixed_file.mp4"
-          echo "✅ Done. Replacing original file..."
-          mv "fixed_file.mp4" "${{ inputs.filename }}"
-
-      - name: Delete old file from Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "🗑️ Deleting old file from release..."
-          gh release delete-asset ${{ inputs.tag }} "${{ inputs.filename }}" --yes
-
-      - name: Upload fixed file back to Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag }}
-          files: ${{ inputs.filename }}
-
-      - name: Print result
-        run: |
-          LINK="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/${{ inputs.filename }}"
-          echo "🔗 Updated download link: $LINK"
-          {
-            echo "### 🔗 لینک دانلود (اصلاح‌شده)"
-            echo ""
-            echo '```'
-            echo "$LINK"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "=================================================="
+          echo "🎬 Processing: $FILENAME"
+          
+          # 1. دانلود فایل
+          echo "⬇️ Downloading..."
+          gh release download "$TAG" --pattern "$FILENAME" --repo ${{ github.repository }}
+          
+          # 2. چک کردن سالم بودن فایل (تا فایل خراب رو دستکاری نکنیم)
+          echo "🔍 Validating file structure..."
+          if ! ffmpeg -v error -i "$FILENAME" -t 3 -f null - > /dev/null 2>&1; then
+            echo "❌ ERROR: File $FILENAME is corrupted (missing moov or incomplete)."
+            echo "⚠️ Skipping to avoid further damage."
+            exit 1
+          fi
+          
+          echo "✅ File is valid. Moving moov to the front..."
+          
+          # 3. اجرای دستور faststart (بدون هیچ تغییری در کیفیت)
+          ffmpeg -y -hide_banner -loglevel warning \
+            -i "$FILENAME" \
+            -c copy \
+            -movflags +faststart \
+            "fixed_$FILENAME"
+          
+          # 4. جایگزینی فایل قبلی با فایل جدید
+          if [ -f "fixed_$FILENAME" ]; then
+            echo "✅ Fix successful. Replacing in Release..."
+            
+            # حذف فایل قدیمی
+            gh release delete-asset "$TAG" "$FILENAME" --yes --repo ${{ github.repository }}
+            
+            # تغییر نام فایل جدید به اسم اصلی
+            mv "fixed_$FILENAME" "$FILENAME"
+            
+            # آپلود فایل جدید
+            gh release upload "$TAG" "$FILENAME" --clobber --repo ${{ github.repository }}
+            
+            echo "✅ $FILENAME replaced successfully. Ready for streaming."
+          else
+            echo "❌ Fix failed for $FILENAME"
+            exit 1
+          fi
