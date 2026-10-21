@@ -1,0 +1,71 @@
+name: Check GitHub API Rate Limit
+
+on:
+  workflow_dispatch: # اجازه اجرای دستی از تب Actions
+  schedule:
+    - cron: '0 */6 * * *' # اجرای خودکار هر ۶ ساعت (اختیاری)
+
+jobs:
+  check-rate-limit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Fetch and Display Rate Limit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🔍 در حال دریافت اطلاعات Rate Limit از GitHub API..."
+          
+          # دریافت اطلاعات Rate Limit
+          RATE_LIMIT_JSON=$(gh api rate_limit)
+          
+          # استخراج مقادیر اصلی (Core API) با استفاده از jq
+          CORE_LIMIT=$(echo "$RATE_LIMIT_JSON" | jq '.resources.core.limit')
+          CORE_REMAINING=$(echo "$RATE_LIMIT_JSON" | jq '.resources.core.remaining')
+          CORE_RESET=$(echo "$RATE_LIMIT_JSON" | jq '.resources.core.reset')
+          
+          # استخراج مقادیر Search API
+          SEARCH_LIMIT=$(echo "$RATE_LIMIT_JSON" | jq '.resources.search.limit')
+          SEARCH_REMAINING=$(echo "$RATE_LIMIT_JSON" | jq '.resources.search.remaining')
+          
+          # استخراج مقادیر GraphQL API
+          GRAPHQL_LIMIT=$(echo "$RATE_LIMIT_JSON" | jq '.resources.graphql.limit')
+          GRAPHQL_REMAINING=$(echo "$RATE_LIMIT_JSON" | jq '.resources.graphql.remaining')
+          
+          # تبدیل زمان ریست به فرمت خوانا
+          RESET_TIME=$(date -d "@$CORE_RESET" '+%Y-%m-%d %H:%M:%S UTC')
+          
+          echo "=========================================="
+          echo "       GitHub API Rate Limit Status       "
+          echo "=========================================="
+          echo ""
+          echo "📊 Core API (عمومی):"
+          echo "   باقی‌مانده: $CORE_REMAINING از $CORE_LIMIT"
+          echo "   زمان ریست: $RESET_TIME"
+          echo ""
+          echo "🔍 Search API (جستجو):"
+          echo "   باقی‌مانده: $SEARCH_REMAINING از $SEARCH_LIMIT"
+          echo ""
+          echo "📈 GraphQL API:"
+          echo "   باقی‌مانده: $GRAPHQL_REMAINING از $GRAPHQL_LIMIT"
+          echo "=========================================="
+          
+          # هشدار در صورت کم بودن سهمیه
+          if [ "$CORE_REMAINING" -lt 500 ]; then
+            echo "::error::⚠️ هشدار: سهمیه Core API کمتر از ۵۰۰ درخواست باقی مانده!"
+          elif [ "$CORE_REMAINING" -lt 1000 ]; then
+            echo "::warning::⚠️ توجه: سهمیه Core API کمتر از ۱۰۰۰ درخواست باقی مانده."
+          else
+            echo "✅ وضعیت سهمیه Core API مناسب است."
+          fi
+
+      - name: Write Summary to Step Summary
+        run: |
+          echo "## 📊 GitHub API Rate Limit" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| نوع API | باقی‌مانده | محدودیت کل |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----------|------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Core | ${{ steps.rate-limit.outputs.core_remaining }} | ${{ steps.rate-limit.outputs.core_limit }} |" >> $GITHUB_STEP_SUMMARY
+        if: always()
