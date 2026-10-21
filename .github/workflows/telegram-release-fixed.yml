@@ -1,0 +1,451 @@
+name: Telegram Saved Messages -> Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_count:
+        description: "How many NEW videos? (1-100)"
+        required: true
+        default: "5"
+      runner_count:
+        description: "How many GitHub runners? (1-20)"
+        required: true
+        default: "3"
+      release_mode:
+        description: "Release mode"
+        required: true
+        default: "fixed"
+        type: choice
+        options: [fixed, per_run]
+      release_tag:
+        description: "Base release tag"
+        required: true
+        default: "telegram-files"
+      release_name:
+        description: "Base release name"
+        required: true
+        default: "Telegram Files"
+      filename_prefix:
+        description: "Optional filename prefix"
+        required: false
+        default: ""
+      skip_existing:
+        description: "Skip videos already uploaded to this release?"
+        required: true
+        default: true
+        type: boolean
+      download_retries:
+        description: "Telegram download attempts (1-10)"
+        required: true
+        default: "3"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: telegram-${{ inputs.release_mode }}-${{ inputs.release_tag }}-${{ inputs.release_mode == 'per_run' && github.run_id || 'fixed' }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      actual_runners: ${{ steps.matrix.outputs.actual_runners }}
+      selected_ids: ${{ steps.select.outputs.selected_ids }}
+      selected_count: ${{ steps.select.outputs.selected_count }}
+      effective_tag: ${{ steps.release.outputs.tag }}
+      effective_name: ${{ steps.release.outputs.name }}
+
+    steps:
+      - name: Validate inputs
+        shell: bash
+        env:
+          FILE_COUNT: ${{ inputs.file_count }}
+          RUNNER_COUNT: ${{ inputs.runner_count }}
+          DOWNLOAD_RETRIES: ${{ inputs.download_retries }}
+        run: |
+          set -euo pipefail
+          [[ "$FILE_COUNT" =~ ^[0-9]+$ ]] || { echo "file_count must be an integer"; exit 1; }
+          [[ "$RUNNER_COUNT" =~ ^[0-9]+$ ]] || { echo "runner_count must be an integer"; exit 1; }
+          [[ "$DOWNLOAD_RETRIES" =~ ^[0-9]+$ ]] || { echo "download_retries must be an integer"; exit 1; }
+          (( FILE_COUNT >= 1 && FILE_COUNT <= 100 )) || { echo "file_count must be 1-100"; exit 1; }
+          (( RUNNER_COUNT >= 1 && RUNNER_COUNT <= 20 )) || { echo "runner_count must be 1-20"; exit 1; }
+          (( DOWNLOAD_RETRIES >= 1 && DOWNLOAD_RETRIES <= 10 )) || { echo "download_retries must be 1-10"; exit 1; }
+
+      - name: Determine release
+        id: release
+        shell: bash
+        env:
+          MODE: ${{ inputs.release_mode }}
+          BASE_TAG: ${{ inputs.release_tag }}
+          BASE_NAME: ${{ inputs.release_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" == "per_run" ]]; then
+            TAG="${BASE_TAG}-${RUN_ID}"
+            NAME="${BASE_NAME} #${RUN_ID}"
+          else
+            TAG="$BASE_TAG"
+            NAME="$BASE_NAME"
+          fi
+          [[ -n "$TAG" && -n "$NAME" ]] || { echo "Release tag/name cannot be empty"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          NAME: ${{ steps.release.outputs.name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$NAME"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$NAME" \
+              --notes "Telegram Saved Messages videos optimized for progressive streaming (FastStart)."
+          fi
+
+      - name: Snapshot existing release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          : > existing-assets.txt
+          RELEASE_ID="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.id')"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+            --jq '.[].name' > existing-assets.txt
+          echo "Existing assets: $(wc -l < existing-assets.txt)"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Telegram dependencies
+        run: python -m pip install --disable-pip-version-check telethon cryptg
+
+      - name: Select newest NEW videos
+        id: select
+        shell: bash
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          FILE_COUNT: ${{ inputs.file_count }}
+          SKIP_EXISTING: ${{ inputs.skip_existing }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import asyncio, json, os, re
+          from pathlib import Path
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
+
+          API_ID=int(os.environ["API_ID"]); API_HASH=os.environ["API_HASH"]; SESSION=os.environ["TELEGRAM_SESSION"]
+          WANT=int(os.environ["FILE_COUNT"]); SKIP=os.environ.get("SKIP_EXISTING","true").lower()=="true"
+          EXTS={".mp4",".m4v",".mov"}; MIMES={"video/mp4","video/x-m4v","video/quicktime"}
+          existing=set()
+          p=Path("existing-assets.txt")
+          if p.exists():
+              for name in p.read_text(encoding="utf-8",errors="replace").splitlines():
+                  m=re.match(r"^(\d+)_",name.strip())
+                  if m: existing.add(int(m.group(1)))
+
+          def supported(m):
+              if not m.media or not m.document or not m.file: return False
+              ext=(m.file.ext or (Path(m.file.name).suffix if m.file.name else "") or "").lower()
+              mime=(m.file.mime_type or "").split(";",1)[0].strip().lower()
+              return ext in EXTS or mime in MIMES
+
+          async def main():
+              c=TelegramClient(StringSession(SESSION),API_ID,API_HASH,request_retries=10,connection_retries=10,retry_delay=2,auto_reconnect=True)
+              await c.connect()
+              try:
+                  if not await c.is_user_authorized(): raise RuntimeError("TELEGRAM_SESSION is invalid or unauthorized")
+                  selected=[]; scanned=0; skipped=0
+                  # Keep scanning Saved Messages until enough NEW supported videos
+                  # are found, or Telegram history is exhausted.
+                  async for m in c.iter_messages("me",limit=None):
+                      scanned+=1
+                      if not supported(m): continue
+                      if SKIP and m.id in existing:
+                          skipped+=1; continue
+                      selected.append(m.id)
+                      print(f"SELECT {len(selected)}/{WANT}: {m.id}")
+                      if len(selected)>=WANT: break
+                  if not selected:
+                      print("Nothing new to upload: no unseen MP4/M4V/MOV videos found.")
+                      with Path(os.environ["GITHUB_OUTPUT"]).open("a",encoding="utf-8") as f:
+                          f.write("selected_ids=[]\nselected_count=0\n")
+                      return
+                  if len(selected)<WANT: print(f"WARNING: requested {WANT}, but Telegram history contained only {len(selected)} matching new videos")
+                  out=Path(os.environ["GITHUB_OUTPUT"])
+                  with out.open("a",encoding="utf-8") as f:
+                      f.write("selected_ids="+json.dumps(selected,separators=(",",":"))+"\n")
+                      f.write(f"selected_count={len(selected)}\n")
+                  print(f"Scanned={scanned}, skipped_existing={skipped}, selected={len(selected)}")
+              finally:
+                  await c.disconnect()
+          asyncio.run(main())
+          PY
+
+      - name: Build runner matrix
+        id: matrix
+        shell: bash
+        env:
+          REQUESTED_RUNNERS: ${{ inputs.runner_count }}
+          SELECTED_COUNT: ${{ steps.select.outputs.selected_count }}
+        run: |
+          set -euo pipefail
+          if (( SELECTED_COUNT == 0 )); then
+            echo "Nothing new to upload."
+            echo "actual_runners=1" >> "$GITHUB_OUTPUT"
+            echo 'matrix={"runner":[0]}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ACTUAL="$REQUESTED_RUNNERS"
+          (( ACTUAL > SELECTED_COUNT )) && ACTUAL="$SELECTED_COUNT"
+          MATRIX="$(python3 - "$ACTUAL" <<'PY'
+          import json,sys
+          n=int(sys.argv[1]); print(json.dumps({"runner":list(range(n))},separators=(",",":")))
+          PY
+          )"
+          echo "actual_runners=$ACTUAL" >> "$GITHUB_OUTPUT"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  telegram:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.selected_count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --disable-pip-version-check telethon cryptg
+
+      - name: Download, validate, FastStart, upload, delete
+        shell: bash
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          SELECTED_IDS: ${{ needs.prepare.outputs.selected_ids }}
+          RUNNER_INDEX: ${{ matrix.runner }}
+          RUNNER_TOTAL: ${{ needs.prepare.outputs.actual_runners }}
+          FILENAME_PREFIX: ${{ inputs.filename_prefix }}
+          DOWNLOAD_RETRIES: ${{ inputs.download_retries }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.effective_tag }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import asyncio, json, os, re, subprocess, sys, time
+          from pathlib import Path
+          from telethon import TelegramClient
+          from telethon.errors import FloodWaitError
+          from telethon.sessions import StringSession
+
+          API_ID=int(os.environ["API_ID"]); API_HASH=os.environ["API_HASH"]; SESSION=os.environ["TELEGRAM_SESSION"]
+          IDS=json.loads(os.environ["SELECTED_IDS"]); RI=int(os.environ["RUNNER_INDEX"]); RT=int(os.environ["RUNNER_TOTAL"])
+          PREFIX=os.environ.get("FILENAME_PREFIX","").strip(); RETRIES=int(os.environ["DOWNLOAD_RETRIES"])
+          TAG=os.environ["TAG"]; REPO=os.environ["GITHUB_REPOSITORY"]
+          WORK=Path("work"); WORK.mkdir(exist_ok=True); RESULTS=Path("results.txt")
+          EXTS={".mp4",".m4v",".mov"}
+          MIMES={"video/mp4","video/x-m4v","video/quicktime"}
+
+          def supported(m):
+              if not m or not m.media or not m.document or not m.file: return False
+              ext=(m.file.ext or (Path(m.file.name).suffix if m.file.name else "") or "").lower()
+              mime=(m.file.mime_type or "").split(";",1)[0].strip().lower()
+              return ext in EXTS or mime in MIMES
+
+          def safe(s):
+              s=re.sub(r"[^A-Za-z0-9._-]+","_",s).strip("._")
+              return s or "telegram_video"
+
+          def filename(m):
+              ext=(m.file.ext or "").lower()
+              mime=(m.file.mime_type or "").split(";",1)[0].lower()
+              if ext not in EXTS: ext=".mov" if mime=="video/quicktime" else ".mp4"
+              stem=safe(Path(m.file.name).stem) if m.file.name else f"telegram_{m.id}"
+              base=stem+ext
+              if PREFIX: base=safe(f"{PREFIX}_{base}")
+              return f"{m.id}_{base}"
+
+          def atoms(path):
+              total=path.stat().st_size; out=[]; pos=0
+              if total<8: raise ValueError("file too small")
+              with path.open("rb") as f:
+                  while pos<total:
+                      if total-pos<8: raise ValueError(f"truncated atom header at {pos}")
+                      f.seek(pos); h=f.read(8); size32=int.from_bytes(h[:4],"big"); kind=h[4:8]; header=8
+                      if size32==1:
+                          x=f.read(8)
+                          if len(x)!=8: raise ValueError(f"truncated extended size at {pos}")
+                          size=int.from_bytes(x,"big"); header=16
+                      elif size32==0: size=total-pos
+                      else: size=size32
+                      if size<header or pos+size>total: raise ValueError(f"invalid atom size at {pos}")
+                      out.append((kind,pos,size))
+                      if size32==0: break
+                      pos+=size
+              return out
+
+          def moov_status(path):
+              moov=mdat=None
+              for kind,pos,_ in atoms(path):
+                  if kind==b"moov" and moov is None: moov=pos
+                  if kind==b"mdat" and mdat is None: mdat=pos
+              return moov is not None, mdat is not None, moov is not None and mdat is not None and moov<mdat
+
+          def probe(path):
+              r=subprocess.run(["ffprobe","-v","error","-show_entries","format=format_name,duration,size","-show_entries","stream=index,codec_type,codec_name","-of","json",str(path)],capture_output=True,text=True)
+              if r.returncode: return False,(r.stderr.strip() or "ffprobe failed")
+              try: d=json.loads(r.stdout)
+              except json.JSONDecodeError: return False,"ffprobe returned invalid JSON"
+              if not any(x.get("codec_type")=="video" for x in d.get("streams",[])): return False,"no video stream"
+              if not d.get("format",{}).get("format_name"): return False,"unknown container format"
+              return True,d
+
+          def faststart(src):
+              tmp=src.with_name(".faststart_"+src.name); last="unknown error"
+              for maps in (["-map","0"],["-map","0:v?","-map","0:a?"]):
+                  tmp.unlink(missing_ok=True)
+                  r=subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-y","-i",str(src),*maps,"-c","copy","-movflags","+faststart",str(tmp)],capture_output=True,text=True)
+                  if r.returncode: last=r.stderr.strip() or "ffmpeg failed"; continue
+                  if not tmp.exists() or tmp.stat().st_size==0: last="empty ffmpeg output"; continue
+                  ok,why=probe(tmp)
+                  if not ok: last=f"ffprobe: {why}"; continue
+                  try: moov,mdat,first=moov_status(tmp)
+                  except Exception as e: last=f"atom parser: {e}"; continue
+                  if not (moov and mdat and first): last="FastStart output is not moov-before-mdat"; continue
+                  src.unlink(); tmp.rename(src); return
+              tmp.unlink(missing_ok=True); raise RuntimeError(last)
+
+          def progress_cb():
+              state={"p":-5}
+              def cb(cur,total):
+                  if total:
+                      p=int(cur*100/total)
+                      if p>=state["p"]+5 or p==100:
+                          state["p"]=p; print(f"{p}% | {cur/1048576:.1f}/{total/1048576:.1f} MB",flush=True)
+              return cb
+
+          async def download(c,m,target,expected):
+              last=None
+              for attempt in range(1,RETRIES+1):
+                  target.unlink(missing_ok=True)
+                  try:
+                      print(f"Download attempt {attempt}/{RETRIES}")
+                      result=await c.download_media(m,file=str(target),progress_callback=progress_cb())
+                      if not result or not target.exists() or target.stat().st_size<=0: raise RuntimeError("download missing/empty")
+                      actual=target.stat().st_size
+                      if expected and actual!=expected: raise RuntimeError(f"incomplete download {actual}/{expected}")
+                      return
+                  except FloodWaitError as e:
+                      last=e; target.unlink(missing_ok=True)
+                      if attempt < RETRIES:
+                          wait_seconds=max(1,int(e.seconds)+2)
+                          print(f"Telegram FloodWait: waiting {wait_seconds}s before retry")
+                          await asyncio.sleep(wait_seconds)
+                      else:
+                          print(f"Telegram FloodWait on final attempt: {int(e.seconds)}s")
+                  except Exception as e:
+                      last=e; target.unlink(missing_ok=True)
+                      if attempt<RETRIES: await asyncio.sleep(min(60,5*(2**(attempt-1))))
+              raise RuntimeError(f"download failed after {RETRIES} attempts: {last}")
+
+          def upload(path):
+              last=""
+              for attempt in range(1,4):
+                  r=subprocess.run(["gh","release","upload",TAG,str(path),"--repo",REPO,"--clobber"],capture_output=True,text=True)
+                  if r.returncode==0: return
+                  last=r.stderr.strip() or r.stdout.strip(); print(f"Upload attempt {attempt}/3 failed: {last}")
+                  if attempt<3: time.sleep(5*attempt)
+              raise RuntimeError(f"upload failed: {last}")
+
+          def record(status,mid,name,detail=""):
+              detail=str(detail).replace("\n"," ").replace("\r"," ")
+              with RESULTS.open("a",encoding="utf-8") as f: f.write(f"{status}\t{mid}\t{name}\t{detail}\n")
+
+          async def main():
+              assigned=[mid for i,mid in enumerate(IDS) if i%RT==RI]
+              print(f"Runner {RI+1}/{RT}; assigned IDs: {assigned}")
+              if not assigned: return
+              c=TelegramClient(StringSession(SESSION),API_ID,API_HASH,request_retries=10,connection_retries=10,retry_delay=2,auto_reconnect=True)
+              await c.connect(); failures=0
+              try:
+                  if not await c.is_user_authorized(): raise RuntimeError("TELEGRAM_SESSION is invalid or unauthorized")
+                  for mid in assigned:
+                      target=None
+                      try:
+                          m=await c.get_messages("me",ids=mid)
+                          if not m or not m.file: raise RuntimeError("message/file no longer exists")
+                          if not supported(m): raise RuntimeError("message is no longer a supported MP4/M4V/MOV video")
+                          target=WORK/filename(m); expected=int(m.file.size or 0)
+                          print(f"Processing {mid}: {target.name}")
+                          await download(c,m,target,expected)
+                          ok,why=probe(target)
+                          if not ok: raise RuntimeError(f"original ffprobe failed: {why}")
+                          moov,mdat,first=moov_status(target)
+                          if not moov or not mdat: raise RuntimeError("missing top-level moov/mdat atom")
+                          if not first: faststart(target)
+                          ok,why=probe(target)
+                          if not ok: raise RuntimeError(f"final ffprobe failed: {why}")
+                          moov,mdat,first=moov_status(target)
+                          if not (moov and mdat and first): raise RuntimeError("final file is not FastStart optimized")
+                          upload(target); record("OK",mid,target.name,"uploaded"); print(f"Uploaded: {target.name}")
+                      except Exception as e:
+                          failures+=1; record("FAILED",mid,target.name if target else "unknown",e); print(f"ERROR {mid}: {e}")
+                      finally:
+                          for x in WORK.glob("*"): x.unlink(missing_ok=True)
+              finally:
+                  await c.disconnect()
+              if failures: sys.exit(1)
+          asyncio.run(main())
+          PY
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.effective_tag }}
+          RUNNER_NUM: ${{ matrix.runner }}
+        run: |
+          {
+            echo "## Telegram Worker"
+            echo "**Runner:** $RUNNER_NUM"
+            echo "**Release:** \`$TAG\`"
+            echo "### Videos"
+            if [[ -s results.txt ]]; then
+              while IFS=$'\t' read -r status mid name detail; do
+                if [[ "$status" == "OK" ]]; then
+                  echo "- ✅ \`$name\` — Telegram ID \`$mid\`"
+                else
+                  echo "- ❌ \`$name\` — Telegram ID \`$mid\` — $detail"
+                fi
+              done < results.txt
+            else
+              echo "_No videos processed._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
