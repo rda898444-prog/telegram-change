@@ -1,0 +1,40 @@
+name: Collect YAML Files
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  collect-yaml:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find and merge all YAML files
+        run: |
+          OUTPUT="all-yaml-files.txt"
+          > "$OUTPUT"
+
+          # پیدا کردن همه فایل‌های yml/yaml به جز پوشه‌های .git و node_modules
+          find . -type f \( -name "*.yml" -o -name "*.yaml" \) \
+            -not -path "./.git/*" \
+            -not -path "*/node_modules/*" \
+            | sort | while read -r file; do
+
+              echo "===========================================" >> "$OUTPUT"
+              echo "FILE: $file" >> "$OUTPUT"
+              echo "===========================================" >> "$OUTPUT"
+              cat "$file" >> "$OUTPUT"
+              echo -e "\n" >> "$OUTPUT"
+          done
+
+          echo "✅ خروجی در فایل $OUTPUT ساخته شد"
+          wc -l "$OUTPUT"
+
+      - name: Upload result as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yaml-collection
+          path: all-yaml-files.txt.github/workflows/collect-yaml.yml
