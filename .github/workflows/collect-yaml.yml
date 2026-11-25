@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   collect-yaml:
     runs-on: ubuntu-latest
@@ -17,12 +20,10 @@ jobs:
           OUTPUT="all-yaml-files.txt"
           > "$OUTPUT"
 
-          # پیدا کردن همه فایل‌های yml/yaml به جز پوشه‌های .git و node_modules
           find . -type f \( -name "*.yml" -o -name "*.yaml" \) \
             -not -path "./.git/*" \
             -not -path "*/node_modules/*" \
             | sort | while read -r file; do
-
               echo "===========================================" >> "$OUTPUT"
               echo "FILE: $file" >> "$OUTPUT"
               echo "===========================================" >> "$OUTPUT"
@@ -30,11 +31,20 @@ jobs:
               echo -e "\n" >> "$OUTPUT"
           done
 
-          echo "✅ خروجی در فایل $OUTPUT ساخته شد"
-          wc -l "$OUTPUT"
-
-      - name: Upload result as artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload to Release
+        id: release
+        uses: softprops/action-gh-release@v2
         with:
-          name: yaml-collection
-          path: all-yaml-files.txt.github/workflows/collect-yaml.yml
+          tag_name: yaml-collection-${{ github.run_id }}
+          name: "YAML Collection - ${{ github.run_number }}"
+          body: "همه فایل‌های YAML مخزن در یک فایل جمع‌آوری شدند."
+          files: all-yaml-files.txt
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Print Download Link
+        run: |
+          echo "==========================================="
+          echo "✅ فایل با موفقیت در Releases آپلود شد"
+          echo "🔗 لینک دانلود مستقیم:"
+          echo "${{ fromJSON(steps.release.outputs.assets)[0].browser_download_url }}"
+          echo "==========================================="
